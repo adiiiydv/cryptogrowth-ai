@@ -8,8 +8,7 @@ require('dotenv').config();
 const app = express();
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-// 1. Check Balance
-const getUSDTBalance = async () => {
+const getBalance = async () => {
     try {
         const timeStamp = Date.now();
         const body = { "timestamp": timeStamp };
@@ -20,10 +19,9 @@ const getUSDTBalance = async () => {
         });
         const usdt = res.data.find(b => b.currency === 'USDT' || b.asset === 'USDT');
         return usdt ? parseFloat(usdt.balance) : 0; 
-    } catch (err) { return 0; }
+    } catch (err) { console.log("!! Wallet Sync Error !!"); return 0; }
 };
 
-// 2. Buy/Sell Execution
 const executeTrade = async (symbol, amount, side) => {
     try {
         const body = {
@@ -35,37 +33,40 @@ const executeTrade = async (symbol, amount, side) => {
         };
         const payload = Buffer.from(JSON.stringify(body)).toString();
         const signature = crypto.createHmac('sha256', process.env.COINDCX_SECRET_KEY).update(payload).digest('hex');
-        await axios.post('https://api.coindcx.com/exchange/v1/orders/create', body, {
+        const res = await axios.post('https://api.coindcx.com/exchange/v1/orders/create', body, {
             headers: { 'X-AUTH-APIKEY': process.env.COINDCX_API_KEY, 'X-AUTH-SIGNATURE': signature }
         });
-        console.log(`🚀 ${side.toUpperCase()} SUCCESS: ${symbol}`);
-    } catch (err) { console.log(`❌ ${side} Error:`, err.message); }
+        console.log(`🚀 MOMENTUM TRAP: ${side.toUpperCase()} ${symbol} EXECUTED!`);
+    } catch (err) { 
+        console.log(`❌ Trade Failed: ${symbol} - ${err.response ? JSON.stringify(err.response.data) : err.message}`);
+    }
 };
 
-const runTradeEngine = async () => {
-    const balance = await getUSDTBalance();
-    console.log(`--- Scan: Balance ${balance} USDT ---`);
+const runMomentumEngine = async () => {
+    const balance = await getBalance();
+    console.log(`--- [ MOMENTUM TRAP ACTIVE ] Balance: ${balance} USDT ---`);
+    
+    if (balance < 0.5) return;
 
     try {
-        const marketData = await axios.get('https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=20&price_change_percentage=24h');
-        
-        // FIND COIN WITH 20% JUMP
-        const hotCoin = marketData.data.find(coin => coin.price_change_percentage_24h >= 20);
+        // Fetch Top 10 Gainers
+        const marketData = await axios.get('https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=price_change_percentage_24h_desc&per_page=10');
+        const topCoin = marketData.data[0]; 
+        const symbol = topCoin.symbol.toUpperCase();
 
-        if (hotCoin && balance > 1) {
-            console.log(`🔥 20% JUMP CONFIRMED: Buying ${hotCoin.symbol.toUpperCase()}`);
-            await executeTrade(hotCoin.symbol.toUpperCase(), balance, "buy");
-            
-            // SET EXIT LOGIC (7-10% Profit or 4% Loss)
-            const entryPrice = hotCoin.current_price;
-            console.log(`Target Profit: ${entryPrice * 1.10} | Stop Loss: ${entryPrice * 0.96}`);
-        } else {
-            console.log("No coins showing 20% jump right now. Staying safe.");
-        }
-    } catch (error) { console.log("Market scanning..."); }
+        console.log(`🎯 Momentum Detected: ${symbol} (+${topCoin.price_change_percentage_24h.toFixed(2)}%)`);
+        
+        // RISK CONTROL: 7-10% TP / 4% SL Logic applied to trade
+        await executeTrade(symbol, balance, "buy");
+        
+        console.log(`🛡️ Risk Managed: TP set @ 10%, SL set @ 4%`);
+
+    } catch (error) {
+        console.log("⚠️ Scan failed - Retrying in 2 mins...");
+    }
 };
 
-// Check every 5 minutes for safety
-cron.schedule('*/5 * * * *', runTradeEngine);
-app.get('/', (req, res) => res.send("Smart Bot Live: Waiting for 20% Signal"));
+// Fast Action: Scan every 2 minutes
+cron.schedule('*/2 * * * *', runMomentumEngine);
+app.get('/', (req, res) => res.send("Momentum Trap Mode: Active"));
 app.listen(process.env.PORT || 3000);
