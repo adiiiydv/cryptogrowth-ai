@@ -87,6 +87,6 @@ const sniperEngine = async () => {
     }
 };
 
-// Check every 2 minutes for maximum speed without hitting rate limits
+// Check every 5 minutes for maximum speed without hitting rate limits
 cron.schedule('*/2 * * * *', sniperEngine);
 app.listen(process.env.PORT || 3000);
