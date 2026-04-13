@@ -24,6 +24,7 @@ const getUSDTBalance = async () => {
 
 const placeUSDTOrder = async (symbol, amount) => {
     try {
+        console.log(`📡 Sending Market Buy for ${symbol}...`);
         const body = {
             "side": "buy",
             "order_type": "market_order",
@@ -36,37 +37,42 @@ const placeUSDTOrder = async (symbol, amount) => {
         const res = await axios.post('https://api.coindcx.com/exchange/v1/orders/create', body, {
             headers: { 'X-AUTH-APIKEY': process.env.COINDCX_API_KEY, 'X-AUTH-SIGNATURE': signature }
         });
-        console.log(`🚀 TRADE EXECUTED: Bought ${symbol}!`);
+        console.log(`🚀 MISSION SUCCESS: Bought ${symbol}!`);
     } catch (err) {
-        console.log(`❌ Order Failed: ${err.response ? JSON.stringify(err.response.data) : err.message}`);
+        console.log(`❌ Order Failed: Check if ${symbol}/USDT exists on CoinDCX.`);
     }
 };
 
 const runTradeEngine = async () => {
     const balance = await getUSDTBalance();
-    console.log(`--- Scan: Balance ${balance} USDT ---`);
+    console.log(`--- FAST SCAN: Balance ${balance} USDT ---`);
     
-    if (balance < 1) return;
+    if (balance < 0.5) {
+        console.log("No USDT to trade. Order already filled or wallet empty.");
+        return;
+    }
 
     try {
         const marketData = await axios.get('https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=price_change_percentage_24h_desc&per_page=5');
         const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
         
-        // Simplified prompt to force a choice
-        const prompt = `Pick the #1 coin symbol from this list to buy for a quick scalp. Return ONLY JSON: {"coin": "SYMBOL"}. Data: ${JSON.stringify(marketData.data)}`;
+        // FORCED COMMAND: No waiting allowed.
+        const prompt = `COMMAND: You are a high-speed scalper. You MUST pick the best coin from this list to buy NOW. Do not explain. Return ONLY JSON: {"coin": "SYMBOL"}. Data: ${JSON.stringify(marketData.data)}`;
 
         const result = await model.generateContent(prompt);
         const decision = JSON.parse(result.response.text().trim());
 
         if (decision.coin) {
-            console.log(`🎯 AI picked ${decision.coin}. Buying now...`);
+            console.log(`🎯 AI FORCE-PICK: ${decision.coin}. executing trade...`);
             await placeUSDTOrder(decision.coin.toUpperCase(), balance);
         }
     } catch (error) {
-        console.log("Waiting for next clear signal...");
+        console.log("System glitch, retrying in 2 mins...");
     }
 };
 
-cron.schedule('*/5 * * * *', runTradeEngine);
-app.get('/', (req, res) => res.send("Bot Active"));
+// Faster 2-minute interval
+cron.schedule('*/2 * * * *', runTradeEngine);
+
+app.get('/', (req, res) => res.send("Rapid-Trader Active"));
 app.listen(process.env.PORT || 3000);
