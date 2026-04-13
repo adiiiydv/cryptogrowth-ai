@@ -8,6 +8,33 @@ require('dotenv').config();
 const app = express();
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
+// 1. Function to place the actual trade
+const placeOrder = async (coinSymbol) => {
+    try {
+        const timeStamp = Date.now();
+        const body = {
+            "side": "buy",
+            "order_type": "market_order",
+            "market": `${coinSymbol}INR`,
+            "total_quantity": 100, // Fixed amount for the ₹100 challenge
+            "timestamp": timeStamp
+        };
+
+        const payload = Buffer.from(JSON.stringify(body)).toString();
+        const signature = crypto.createHmac('sha256', process.env.COINDCX_SECRET_KEY).update(payload).digest('hex');
+
+        const res = await axios.post('https://api.coindcx.com/exchange/v1/orders/create', body, {
+            headers: {
+                'X-AUTH-APIKEY': process.env.COINDCX_API_KEY,
+                'X-AUTH-SIGNATURE': signature
+            }
+        });
+        console.log(`🚀 SUCCESS: Bought ${coinSymbol}! Order ID: ${res.data.id}`);
+    } catch (err) {
+        console.log(`❌ Trade Failed for ${coinSymbol}:`, err.response ? err.response.data : err.message);
+    }
+};
+
 const getBalance = async () => {
     try {
         const timeStamp = Date.now();
@@ -21,50 +48,47 @@ const getBalance = async () => {
                 'X-AUTH-SIGNATURE': signature
             }
         });
-        // Check for INR in the balance array
         const inr = res.data.find(b => b.currency === 'INR' || b.asset === 'INR');
         const balance = inr ? parseFloat(inr.balance) : 0;
         console.log(`Wallet Balance: ₹${balance}`);
         return balance >= 100;
     } catch (err) {
-        console.log("CoinDCX Syncing...");
+        console.log("Syncing Wallet...");
         return false;
     }
 };
 
 const runTradeEngine = async () => {
-    console.log(`--- Scan: ${new Date().toLocaleTimeString()} ---`);
+    console.log(`--- Scalp Scan: ${new Date().toLocaleTimeString()} ---`);
     const hasFunds = await getBalance();
     
     if (!hasFunds) {
-        console.log("Waiting for INR deposit... Check CoinDCX Wallet.");
+        console.log("Waiting for INR in Coins Wallet...");
         return;
     }
 
     try {
-        const res = await axios.get('https://api.coingecko.com/api/v3/coins/markets?vs_currency=inr&order=price_change_percentage_24h_desc&per_page=15');
-        
-        // Using the newer model version
+        const marketData = await axios.get('https://api.coingecko.com/api/v3/coins/markets?vs_currency=inr&order=price_change_percentage_24h_desc&per_page=10');
         const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
         
-        // STRICT JSON PROMPT
-        const prompt = `Return ONLY a raw JSON object for the best trade. 
-        Target: 30% profit. Stoploss: 7%. 
-        Data: ${JSON.stringify(res.data.slice(0,5))}
-        Format: {"coin": "NAME", "target": "30%", "stoploss": "7%"}`;
+        const prompt = `You are an aggressive scalper. Pick the ONE best coin to buy NOW for 30% profit. 
+        Return ONLY JSON format: {"coin": "SYMBOL"} (e.g. {"coin": "SOL"}). 
+        Data: ${JSON.stringify(marketData.data.slice(0,5))}`;
 
         const result = await model.generateContent(prompt);
-        const responseText = result.response.text();
-        
-        // Log the decision
-        console.log("AI JSON DECISION:", responseText);
+        const decision = JSON.parse(result.response.text().trim());
+
+        if (decision.coin) {
+            console.log(`🎯 AI Selected: ${decision.coin}. Executing Market Buy...`);
+            await placeOrder(decision.coin.toUpperCase());
+        }
     } catch (error) {
-        console.log("AI resting for a moment (Rate limit).");
+        console.log("Engine paused or parsing error. Retrying next cycle.");
     }
 };
 
-// Set to 5 minutes to avoid the 429 Error from your last log
+// Runs every 5 minutes
 cron.schedule('*/5 * * * *', runTradeEngine);
 
-app.get('/', (req, res) => res.send("Scalper Engine Active"));
+app.get('/', (req, res) => res.send("Auto-Trader Live"));
 app.listen(process.env.PORT || 3000);
