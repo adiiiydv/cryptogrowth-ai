@@ -8,15 +8,15 @@ require('dotenv').config();
 const app = express();
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-// 1. Function to place the actual trade
-const placeOrder = async (coinSymbol) => {
+// 1. Function to Buy using USDT
+const placeUSDTOrder = async (coinSymbol, amount) => {
     try {
         const timeStamp = Date.now();
         const body = {
             "side": "buy",
             "order_type": "market_order",
-            "market": `${coinSymbol}INR`,
-            "total_quantity": 100, // Fixed amount for the ₹100 challenge
+            "market": `${coinSymbol}USDT`, // Switched to USDT market
+            "total_quantity": amount,     // Uses your full USDT balance
             "timestamp": timeStamp
         };
 
@@ -29,13 +29,14 @@ const placeOrder = async (coinSymbol) => {
                 'X-AUTH-SIGNATURE': signature
             }
         });
-        console.log(`🚀 SUCCESS: Bought ${coinSymbol}! Order ID: ${res.data.id}`);
+        console.log(`🚀 USDT TRADE SUCCESS: Bought ${coinSymbol}!`);
     } catch (err) {
-        console.log(`❌ Trade Failed for ${coinSymbol}:`, err.response ? err.response.data : err.message);
+        console.log(`❌ USDT Trade Failed:`, err.response ? err.response.data : err.message);
     }
 };
 
-const getBalance = async () => {
+// 2. Function to check USDT Balance
+const getUSDTBalance = async () => {
     try {
         const timeStamp = Date.now();
         const body = { "timestamp": timeStamp };
@@ -48,30 +49,32 @@ const getBalance = async () => {
                 'X-AUTH-SIGNATURE': signature
             }
         });
-        const inr = res.data.find(b => b.currency === 'INR' || b.asset === 'INR');
-        const balance = inr ? parseFloat(inr.balance) : 0;
-        console.log(`Wallet Balance: ₹${balance}`);
-        return balance >= 100;
+        // Look for USDT instead of INR
+        const usdtAsset = res.data.find(b => b.currency === 'USDT' || b.asset === 'USDT');
+        const balance = usdtAsset ? parseFloat(usdtAsset.balance) : 0;
+        console.log(`USDT Wallet Balance: ${balance}`);
+        return balance; 
     } catch (err) {
-        console.log("Syncing Wallet...");
-        return false;
+        console.log("Checking USDT Wallet...");
+        return 0;
     }
 };
 
 const runTradeEngine = async () => {
-    console.log(`--- Scalp Scan: ${new Date().toLocaleTimeString()} ---`);
-    const hasFunds = await getBalance();
+    console.log(`--- USDT Scalp Scan: ${new Date().toLocaleTimeString()} ---`);
+    const balance = await getUSDTBalance();
     
-    if (!hasFunds) {
-        console.log("Waiting for INR in Coins Wallet...");
+    // Bot needs at least 1 USDT to trade
+    if (balance < 1) {
+        console.log("Waiting for USDT in Coins Wallet...");
         return;
     }
 
     try {
-        const marketData = await axios.get('https://api.coingecko.com/api/v3/coins/markets?vs_currency=inr&order=price_change_percentage_24h_desc&per_page=10');
+        const marketData = await axios.get('https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=price_change_percentage_24h_desc&per_page=10');
         const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
         
-        const prompt = `You are an aggressive scalper. Pick the ONE best coin to buy NOW for 30% profit. 
+        const prompt = `You are an aggressive USDT scalper. Pick the ONE best coin to buy with USDT for a 30% pump. 
         Return ONLY JSON format: {"coin": "SYMBOL"} (e.g. {"coin": "SOL"}). 
         Data: ${JSON.stringify(marketData.data.slice(0,5))}`;
 
@@ -79,16 +82,15 @@ const runTradeEngine = async () => {
         const decision = JSON.parse(result.response.text().trim());
 
         if (decision.coin) {
-            console.log(`🎯 AI Selected: ${decision.coin}. Executing Market Buy...`);
-            await placeOrder(decision.coin.toUpperCase());
+            console.log(`🎯 AI Selected: ${decision.coin}. Buying with ${balance} USDT...`);
+            await placeUSDTOrder(decision.coin.toUpperCase(), balance);
         }
     } catch (error) {
-        console.log("Engine paused or parsing error. Retrying next cycle.");
+        console.log("AI deciding or Market busy...");
     }
 };
 
-// Runs every 5 minutes
 cron.schedule('*/5 * * * *', runTradeEngine);
 
-app.get('/', (req, res) => res.send("Auto-Trader Live"));
+app.get('/', (req, res) => res.send("USDT Auto-Trader Active"));
 app.listen(process.env.PORT || 3000);
