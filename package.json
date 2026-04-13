@@ -1,19 +1,6 @@
-{
-  "name": "cryptogrowth-ai",
-  "version": "1.0.0",
-  "description": "AI-powered aggressive crypto scalper for ₹100 challenge",
-  "main": "index.js",
-  "scripts": {
-    "start": "node index.js"
-  },
-  "dependencies": {
-    "@google/generative-ai": "^0.21.0",
-    "axios": "^1.6.0",
-    "dotenv": "^16.3.1",
-    "express": "^4.18.2",
-    "node-cron": "^3.0.3"
-  },
-  "engines": {
-    "node": ">=18.0.0"
-  }
+"dependencies": {
+  "axios": "^1.x.x",
+  "node-cron": "^3.x.x",
+  "technicalindicators": "^3.1.0",
+  "dotenv": "^16.x.x"
 }
