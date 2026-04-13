@@ -8,18 +8,15 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// SERVER HEALTH
-app.get('/', (req, res) => res.send('Apex Pro v2: Stable 🚀'));
+app.get('/', (req, res) => res.send('Apex Pro: Aggressive Mode 🚀'));
 app.listen(PORT, () => console.log(`✅ System Live on Port ${PORT}`));
 
-// CONFIG
 let WATCHLIST = ['SOL', 'BTC', 'ETH', 'DOGE', 'MATIC', 'ADA', 'XRP'];
 let activeTrades = [];
 const MAX_TRADES = 3;
 let lastTradeTime = 0;
 const COOLDOWN = 2 * 60 * 1000; 
 
-// Helper for rate limits
 const delay = ms => new Promise(res => setTimeout(res, ms));
 
 const signDCX = (body) => {
@@ -27,9 +24,7 @@ const signDCX = (body) => {
     return crypto.createHmac('sha256', process.env.COINDCX_SECRET_KEY).update(payload).digest('hex');
 };
 
-// MAIN SCANNER
 const runMultiScanner = async () => {
-    // 1. Check existing trades (Safe loop for splicing)
     for (let i = activeTrades.length - 1; i >= 0; i--) {
         await checkTrailingExit(activeTrades[i], i);
     }
@@ -37,7 +32,6 @@ const runMultiScanner = async () => {
     if (activeTrades.length >= MAX_TRADES) return;
 
     const shuffledList = [...WATCHLIST].sort(() => Math.random() - 0.5);
-
     let balance = 4.01;
     try {
         const body = { timestamp: Date.now() };
@@ -55,7 +49,7 @@ const runMultiScanner = async () => {
         if (activeTrades.find(t => t.symbol === coin)) continue;
 
         try {
-            await delay(500); // Prevent API ban
+            await delay(500); 
             const res = await axios.get(`https://api.binance.com/api/v3/klines?symbol=${coin}USDT&interval=1m&limit=100`);
             const prices = res.data.map(d => parseFloat(d[4]));
             const volumes = res.data.map(d => parseFloat(d[5]));
@@ -63,17 +57,30 @@ const runMultiScanner = async () => {
             const rsi = RSI.calculate({ values: prices, period: 14 }).pop();
             const ema9 = EMA.calculate({ values: prices, period: 9 }).pop();
             const ema21 = EMA.calculate({ values: prices, period: 21 }).pop();
-            const ema50 = EMA.calculate({ values: prices, period: 50 }).pop();
 
             const avgVolume = volumes.slice(-10).reduce((a, b) => a + b, 0) / 10;
             const currentVolume = volumes[volumes.length - 1];
             const currentPrice = prices[prices.length - 1];
+            
+            // --- NEW PRICE MOMENTUM LOGIC ---
+            const prevPrice = prices[prices.length - 2];
+            const priceMomentum = currentPrice > prevPrice;
 
-            console.log(`📊 ${coin.padEnd(5)} | RSI:${rsi.toFixed(1)} | Trend:${currentPrice > ema50 ? '📈' : '📉'} | Vol:${currentVolume > avgVolume ? '🔥' : '❄️'}`);
+            // --- DEBUG LOG REQUESTED ---
+            console.log(`🧠 CHECK → ${coin} | RSI:${rsi.toFixed(1)} | EMA:${ema9 >= ema21} | VOL:${currentVolume > (avgVolume * 0.8)} | COOLDOWN:${Date.now() - lastTradeTime > COOLDOWN}`);
 
-            if (rsi < 45 && ema9 >= ema21 && currentVolume > avgVolume && currentPrice > ema50 && (Date.now() - lastTradeTime > COOLDOWN)) {
-                console.log(`🎯 BUY SIGNAL: ${coin}`);
-                const tradeAmount = Math.max(2, (balance * 0.30)).toFixed(2); // Min 2 USDT for safety
+            // --- REVISED AGGRESSIVE CONDITION ---
+            if (
+                rsi < 55 &&
+                ema9 >= ema21 &&
+                currentVolume > (avgVolume * 0.8) &&
+                priceMomentum &&
+                (Date.now() - lastTradeTime > COOLDOWN)
+            ) {
+                console.log(`🎯 AGGRESSIVE SIGNAL: ${coin}`);
+                // Trade size: 40% of balance or minimum 3 USDT
+                const tradeAmount = Math.max(3, (balance * 0.40)).toFixed(2); 
+                
                 const bought = await executeOrder("buy", coin, tradeAmount);
                 if (bought) {
                     activeTrades.push({ symbol: coin, entry: bought.price, qty: bought.qty, highestPrice: bought.price });
@@ -107,8 +114,6 @@ async function executeOrder(side, symbol, amount, exactQty = null) {
     try {
         const pRes = await axios.get(`https://api.binance.com/api/v3/ticker/price?symbol=${symbol}USDT`);
         const price = parseFloat(pRes.data.price);
-        
-        // Fix: Quantity must not have too many decimals for CoinDCX
         const qty = exactQty ? exactQty : (Math.floor((amount / price) * 100) / 100).toString();
 
         const body = { side, order_type: "market_order", market: `${symbol}USDT`, total_quantity: qty, timestamp: Date.now() };
@@ -117,7 +122,7 @@ async function executeOrder(side, symbol, amount, exactQty = null) {
         });
         return { price, qty };
     } catch (err) {
-        console.log(`❌ Order Failed: ${err.response?.data?.message || "API Error"}`);
+        console.log(`❌ Order Failed: ${err.response?.data?.message || "Check USDT Balance"}`);
         return null;
     }
 }
