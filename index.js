@@ -1,50 +1,41 @@
-const express = require('express');
-const axios = require('axios');
-const crypto = require('crypto');
-const cron = require('node-cron');
-const { RSI, EMA } = require('technicalindicators');
-require('dotenv').config();
+// --- DYNAMIC CONFIG ---
+let WATCHLIST = ['SOL', 'BTC', 'ETH', 'DOGE', 'MATIC', 'ADA', 'XRP'];
+const DISCOVERY_LIMIT = 3; // Number of "discovered" coins to add
 
-const app = express();
-let activeTrade = null;
+// --- 1. RESEARCH FUNCTION (Finds new potential coins) ---
+const researchNewCoins = async () => {
+    try {
+        console.log("🕵️ Researching new high-potential coins...");
+        // Fetch 24hr stats for all symbols
+        const res = await axios.get('https://api.binance.com/api/v3/ticker/24hr');
+        
+        // Filter for USDT pairs, high volume, and price action
+        const topPotentials = res.data
+            .filter(t => t.symbol.endsWith('USDT'))
+            .filter(t => parseFloat(t.quoteVolume) > 10000000) // Only coins with >10M Volume
+            .sort((a, b) => parseFloat(b.priceChangePercent) - parseFloat(a.priceChangePercent)) // Sort by gainers
+            .slice(0, DISCOVERY_LIMIT)
+            .map(t => t.symbol.replace('USDT', ''));
 
-// --- CONFIG ---
-const WATCHLIST = ['SOL', 'BTC', 'ETH', 'DOGE', 'MATIC', 'ADA', 'XRP'];
-const STOP_LOSS_PCT = 1.2;
-const TAKE_PROFIT_PCT = 2.5;
-
-const signDCX = (body) => {
-    const payload = Buffer.from(JSON.stringify(body)).toString();
-    return crypto.createHmac('sha256', process.env.COINDCX_SECRET_KEY).update(payload).digest('hex');
+        // Reset Watchlist: Base coins + New discovered gems
+        WATCHLIST = ['SOL', 'BTC', 'ETH', 'DOGE', 'MATIC', 'ADA', 'XRP', ...topPotentials];
+        console.log(`✅ New Watchlist Updated: ${WATCHLIST.join(', ')}`);
+    } catch (e) {
+        console.log("❌ Research failed, keeping current list.");
+    }
 };
 
-async function getOhlcv(symbol) {
-    try {
-        const res = await axios.get(`https://api.binance.com/api/v3/klines?symbol=${symbol}USDT&interval=1m&limit=50`);
-        return res.data.map(d => parseFloat(d[4]));
-    } catch (e) { return null; }
-}
-
+// --- 2. UPDATED SCANNER ---
 const runMultiScanner = async () => {
     if (activeTrade) {
         await checkExit(activeTrade);
         return;
     }
 
-    // --- FETCH LIVE USDT BALANCE ---
-    let currentUSDT = "0.00";
-    try {
-        const body = { timestamp: Date.now() };
-        const balanceRes = await axios.post('https://api.coindcx.com/exchange/v1/users/balances', body, {
-            headers: { 'X-AUTH-APIKEY': process.env.COINDCX_API_KEY, 'X-AUTH-SIGNATURE': signDCX(body) }
-        });
-        const usdtData = balanceRes.data.find(b => b.currency === 'USDT' || b.asset === 'USDT');
-        currentUSDT = usdtData ? parseFloat(usdtData.balance).toFixed(2) : "0.00";
-    } catch (e) {
-        currentUSDT = "Error";
-    }
+    // Fetch Wallet Balance first
+    let currentUSDT = await getBalance(); 
 
-    console.log(`--- 🔍 SCAN | Wallet: ${currentUSDT} USDT | ${new Date().toLocaleTimeString()} ---`);
+    console.log(`--- 🔍 SCAN | Wallet: ${currentUSDT} USDT | Targets: ${WATCHLIST.length} ---`);
 
     for (const coin of WATCHLIST) {
         const prices = await getOhlcv(coin);
@@ -55,10 +46,11 @@ const runMultiScanner = async () => {
         const ema21 = EMA.calculate({ values: prices, period: 21 }).pop();
         const currentPrice = prices[prices.length - 1];
 
-        console.log(`📡 [${coin}] P: ${currentPrice.toFixed(2)} | RSI: ${rsi.toFixed(2)} | EMA9: ${ema9.toFixed(2)}`);
+        console.log(`📡 [${coin}] P: ${currentPrice.toFixed(4)} | RSI: ${rsi.toFixed(2)} | EMA9: ${ema9.toFixed(2)}`);
 
+        // Invest if signal is sure (RSI Oversold + EMA Bullish Cross)
         if (rsi < 30 && ema9 > ema21) {
-            console.log(`🎯 SIGNAL for ${coin}!`);
+            console.log(`🎯 SURE SIGNAL: Investing in ${coin}!`);
             const bought = await executeOrder("buy", coin, (parseFloat(currentUSDT) * 0.98).toFixed(2));
             if (bought) {
                 activeTrade = { symbol: coin, entry: bought.price, qty: bought.qty };
@@ -68,39 +60,8 @@ const runMultiScanner = async () => {
     }
 };
 
-async function checkExit(trade) {
-    try {
-        const prices = await getOhlcv(trade.symbol);
-        const currentPrice = prices[prices.length - 1];
-        const pnl = ((currentPrice - trade.entry) / trade.entry) * 100;
-        console.log(`📈 Monitoring [${trade.symbol}] | PnL: ${pnl.toFixed(2)}%`);
-        
-        if (pnl >= TAKE_PROFIT_PCT || pnl <= -STOP_LOSS_PCT) {
-            const sold = await executeOrder("sell", trade.symbol, (trade.qty * currentPrice).toFixed(2));
-            if (sold) activeTrade = null;
-        }
-    } catch (e) { console.log("Exit Check Error"); }
-}
-
-async function executeOrder(side, symbol, amount) {
-    try {
-        const pRes = await axios.get(`https://api.binance.com/api/v3/ticker/price?symbol=${symbol}USDT`);
-        const price = parseFloat(pRes.data.price);
-        const qty = (amount / price).toFixed(3);
-        const body = { side, order_type: "market_order", market: `${symbol}USDT`, total_quantity: qty, timestamp: Date.now() };
-        await axios.post('https://api.coindcx.com/exchange/v1/orders/create', body, {
-            headers: { 'X-AUTH-APIKEY': process.env.COINDCX_API_KEY, 'X-AUTH-SIGNATURE': signDCX(body) }
-        });
-        return { price, qty };
-    } catch (err) {
-        console.log(`❌ Order Failed: ${err.response?.data?.message || "Error"}`);
-        return null;
-    }
-}
-
-// --- KEEP-ALIVE SERVER (Stops the "Application exited early" error) ---
-app.get('/', (req, res) => res.send('Bot status: Active 🚀'));
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ Server live on port ${PORT}`));
-
+// --- 3. SCHEDULE RESEARCH ---
+// Research new potential coins every 1 hour
+cron.schedule('0 * * * *', researchNewCoins); 
+// Scan market every 1 minute
 cron.schedule('*/1 * * * *', runMultiScanner);
