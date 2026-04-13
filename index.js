@@ -51,7 +51,7 @@ const runTradeEngine = async () => {
         const result = await model.generateContent(prompt);
         console.log("AI Scalp Decision:", result.response.text());
     } catch (error) {
-        console.error("Engine Note: AI is cooling down or model busy. Retrying in 10 mins.");
+        console.error("Engine Note: AI is cooling down or model busy. Retrying in 7 mins.");
     }
 };
 
