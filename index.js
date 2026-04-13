@@ -1,16 +1,16 @@
 const express = require('express');
-const app = express();
-const PORT = process.env.PORT || 3000;
-
-// 1. STABILITY SIGNAL
-app.get('/', (req, res) => res.send('Apex Pro Bot: Active 🚀'));
-app.listen(PORT, () => console.log(`✅ System Live on Port ${PORT}`));
-
 const axios = require('axios');
 const crypto = require('crypto');
 const cron = require('node-cron');
 const { RSI, EMA } = require('technicalindicators');
 require('dotenv').config();
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// 1. STABILITY: Signal "Live" to Render immediately
+app.get('/', (req, res) => res.send('Apex Pro: Active 🚀'));
+app.listen(PORT, () => console.log(`✅ System Live on Port ${PORT}`));
 
 // --- CONFIG ---
 let WATCHLIST = ['SOL', 'BTC', 'ETH', 'DOGE', 'MATIC', 'ADA', 'XRP'];
@@ -21,53 +21,41 @@ const signDCX = (body) => {
     return crypto.createHmac('sha256', process.env.COINDCX_SECRET_KEY).update(payload).digest('hex');
 };
 
-// 2. SCANNER (Bias Removed + Trend Confirmation)
+// 2. APEX PRO SCANNER (Compounding + Bias Removal)
 const runMultiScanner = async () => {
     if (activeTrade) {
         await checkTrailingExit(activeTrade);
         return;
     }
 
-    // Shuffle Watchlist to remove "First Coin Bias"
     const shuffledList = [...WATCHLIST].sort(() => Math.random() - 0.5);
-    
-    // Fetch live balance for Compounding
     let balance = 4.01; 
+
     try {
         const body = { timestamp: Date.now() };
         const balRes = await axios.post('https://api.coindcx.com/exchange/v1/users/balances', body, {
-            headers: { 'X-AUTH-APIKEY': process.env.COINDCX_API_KEY, 'X-AUTH-SIGNATURE': signDCX(body) }
+            headers: { 'X-AUTH-APIKEY': process.env.COINDCX_API_KEY, 'X-AUTH-SIGNATURE': signDCX(body) },
+            timeout: 5000
         });
         const usdtData = balRes.data.find(b => b.currency === 'USDT' || b.asset === 'USDT');
-        balance = usdtData ? parseFloat(usdtData.balance) : balance;
-    } catch (e) { /* use fallback */ }
+        balance = usdtData ? parseFloat(usdtData.balance) : 4.01;
+    } catch (e) { console.log("Balance fetch failed, using fallback."); }
 
     console.log(`--- 🔍 SCAN | Wallet: ${balance.toFixed(2)} USDT | ${new Date().toLocaleTimeString()} ---`);
 
     for (const coin of shuffledList) {
         try {
-            const res = await axios.get(`https://api.binance.com/api/v3/klines?symbol=${coin}USDT&interval=1m&limit=50`);
+            const res = await axios.get(`https://api.binance.com/api/v3/klines?symbol=${coin}USDT&interval=1m&limit=50`, { timeout: 5000 });
             const prices = res.data.map(d => parseFloat(d[4]));
-            
             const rsi = RSI.calculate({ values: prices, period: 14 }).pop();
             const ema9 = EMA.calculate({ values: prices, period: 9 }).pop();
             const ema21 = EMA.calculate({ values: prices, period: 21 }).pop();
 
-            // BETTER SIGNAL: RSI < 35 + EMA Trend Confirmation
             if (rsi < 35 && ema9 > ema21) {
-                console.log(`🎯 SIGNAL: ${coin} RSI:${rsi.toFixed(2)} | Trend: UP`);
-                
-                // COMPOUNDING: Use 95% of current balance for trade
                 const tradeAmount = (balance * 0.95).toFixed(2);
-                
                 const bought = await executeOrder("buy", coin, tradeAmount);
                 if (bought) {
-                    activeTrade = { 
-                        symbol: coin, 
-                        entry: bought.price, 
-                        qty: bought.qty, 
-                        highestPrice: bought.price // For Trailing Profit
-                    };
+                    activeTrade = { symbol: coin, entry: bought.price, qty: bought.qty, highestPrice: bought.price };
                     break;
                 }
             }
@@ -78,27 +66,18 @@ const runMultiScanner = async () => {
 // 3. TRAILING PROFIT LOGIC
 async function checkTrailingExit(trade) {
     try {
-        const res = await axios.get(`https://api.binance.com/api/v3/ticker/price?symbol=${trade.symbol}USDT`);
+        const res = await axios.get(`https://api.binance.com/api/v3/ticker/price?symbol=${trade.symbol}USDT`, { timeout: 5000 });
         const currentPrice = parseFloat(res.data.price);
-        
-        // Update high point for trailing
-        if (currentPrice > trade.highestPrice) {
-            trade.highestPrice = currentPrice;
-            console.log(`🔥 Trailing Up: ${trade.symbol} New High: ${trade.highestPrice}`);
-        }
+        if (currentPrice > trade.highestPrice) trade.highestPrice = currentPrice;
 
         const dropFromTop = ((trade.highestPrice - currentPrice) / trade.highestPrice) * 100;
         const totalGain = ((currentPrice - trade.entry) / trade.entry) * 100;
 
-        // EXIT LOGIC: 
-        // 1. If up 1.5%, sell if price drops 0.5% from the top (Trailing)
-        // 2. Strict Stop Loss at -1.2%
         if ((totalGain > 1.5 && dropFromTop > 0.5) || totalGain <= -1.2) {
-            console.log(`🚪 EXITING: ${trade.symbol} | Gain: ${totalGain.toFixed(2)}%`);
             const sold = await executeOrder("sell", trade.symbol, (trade.qty * currentPrice).toFixed(2));
             if (sold) activeTrade = null;
         }
-    } catch (e) { console.log("Exit check failed"); }
+    } catch (e) { console.log("Exit check failed."); }
 }
 
 async function executeOrder(side, symbol, amount) {
@@ -112,18 +91,9 @@ async function executeOrder(side, symbol, amount) {
         });
         return { price, qty };
     } catch (err) {
-        console.log(`❌ Order Failed: ${err.response?.data?.message}`);
+        console.log(`❌ Order Failed: ${err.response?.data?.message || "Check API Key Spot Permissions"}`);
         return null;
     }
 }
 
 cron.schedule('*/1 * * * *', runMultiScanner);
-const express = require('express');
-const app = express();
-const PORT = process.env.PORT || 3000;
-
-// Tell Render we are alive immediately
-app.get('/', (req, res) => res.send('Bot is Active 🚀'));
-app.listen(PORT, () => console.log(`✅ Health Check Passed on Port ${PORT}`));
-
-// ... rest of your axios, cron, and trading logic follows ...
