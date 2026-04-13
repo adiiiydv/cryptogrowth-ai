@@ -1,6 +1,7 @@
 {
   "name": "cryptogrowth-ai",
   "version": "1.0.0",
+  "description": "Aggressive Compounding Scalper Bot",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -10,6 +11,6 @@
     "axios": "^1.4.0",
     "node-cron": "^3.0.3",
     "dotenv": "^16.3.1",
-    "openai": "^4.0.0"
+    "@google/generative-ai": "^0.1.0"
   }
 }
