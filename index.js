@@ -118,3 +118,12 @@ async function executeOrder(side, symbol, amount) {
 }
 
 cron.schedule('*/1 * * * *', runMultiScanner);
+const express = require('express');
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Tell Render we are alive immediately
+app.get('/', (req, res) => res.send('Bot is Active 🚀'));
+app.listen(PORT, () => console.log(`✅ Health Check Passed on Port ${PORT}`));
+
+// ... rest of your axios, cron, and trading logic follows ...
