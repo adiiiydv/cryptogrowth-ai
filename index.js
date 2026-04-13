@@ -5,8 +5,10 @@ const crypto = require('crypto');
 require('dotenv').config();
 
 const app = express();
-// Persistence: Safe Memory for Active Trades
+
+// GLOBAL MEMORY (Persistence replacement for Render Free Tier)
 let activeTrades = []; 
+const FEES = 0.005; 
 
 const sign = (body) => {
     const payload = Buffer.from(JSON.stringify(body)).toString();
@@ -21,83 +23,82 @@ const getBalance = async () => {
         });
         const usdt = res.data.find(b => b.currency === 'USDT' || b.asset === 'USDT');
         return usdt ? parseFloat(usdt.balance) : 0;
-    } catch (err) { console.error("!! Balance Sync Failed !!"); return 0; }
+    } catch (err) { return 0; }
 };
 
-const placeOrder = async (symbol, side, amount) => {
-    try {
-        const body = {
-            side,
-            order_type: "market_order",
-            market: `${symbol}USDT`,
-            total_quantity: amount,
-            timestamp: Date.now()
-        };
-        const res = await axios.post('https://api.coindcx.com/exchange/v1/orders/create', body, {
-            headers: { 'X-AUTH-APIKEY': process.env.COINDCX_API_KEY, 'X-AUTH-SIGNATURE': sign(body) }
-        });
-        console.log(`🎯 ${side.toUpperCase()} EXECUTED: ${symbol} | Qty: ${amount}`);
-        return res.data;
-    } catch (err) {
-        console.error(`❌ Order Error: ${symbol} - ${err.response?.data?.message || err.message}`);
-        return null;
-    }
-};
-
-// Fixed Symbol Mapping & Price Fetch
 const getPrice = async (symbol) => {
     try {
-        // Fetching multiple at once to save API weight
         const res = await axios.get(`https://api.binance.com/api/v3/ticker/price?symbol=${symbol}USDT`);
         return parseFloat(res.data.price);
     } catch (err) { return null; }
 };
 
+const placeOrder = async (symbol, side, usdtAmount) => {
+    try {
+        const price = await getPrice(symbol);
+        if (!price) return null;
+        
+        // FIX: Manual Quantity Calculation for CoinDCX
+        const quantity = (usdtAmount / price).toFixed(5); 
+
+        const body = {
+            side,
+            order_type: "market_order",
+            market: `${symbol}USDT`,
+            total_quantity: quantity,
+            timestamp: Date.now()
+        };
+
+        await axios.post('https://api.coindcx.com/exchange/v1/orders/create', body, {
+            headers: { 'X-AUTH-APIKEY': process.env.COINDCX_API_KEY, 'X-AUTH-SIGNATURE': sign(body) }
+        });
+
+        console.log(`✅ ${side.toUpperCase()} SUCCESS: ${symbol} | Qty: ${quantity}`);
+        return { price, quantity };
+    } catch (err) {
+        console.error(`❌ Order Error: ${err.response?.data?.message || err.message}`);
+        return null;
+    }
+};
+
 const tradeEngine = async () => {
-    console.log("🔍 [CRITICAL SCAN] Checking Positions...");
-    
-    // 1. SELL SYSTEM: Fee-Adjusted (Net 10% Profit)
+    console.log("🔍 SCANNING MARKET...");
+
+    // 1. SELL LOGIC
     for (let i = activeTrades.length - 1; i >= 0; i--) {
         const trade = activeTrades[i];
         const currentPrice = await getPrice(trade.symbol);
         if (!currentPrice) continue;
 
         const pnl = ((currentPrice - trade.entryPrice) / trade.entryPrice) * 100;
-        console.log(`📊 ${trade.symbol} Tracking: ${pnl.toFixed(2)}%`);
+        console.log(`📊 Tracking ${trade.symbol}: ${pnl.toFixed(2)}%`);
 
-        // Profit target 10.5% (to cover ~0.5% round-trip fees) or 4% Loss
-        if (pnl >= 10.5 || pnl <= -4) {
-            const sold = await placeOrder(trade.symbol, "sell", trade.amount);
+        if (pnl >= (10 + FEES * 100) || pnl <= -4) {
+            const sold = await placeOrder(trade.symbol, "sell", trade.usdtAmount);
             if (sold) activeTrades.splice(i, 1);
         }
     }
 
-    // 2. BUY SYSTEM: Full Capital Strategy
+    // 2. BUY LOGIC (Tuned for 1.92 USDT Balance)
     const balance = await getBalance();
     if (balance > 1.2 && activeTrades.length === 0) {
-        try {
-            const market = await axios.get('https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=price_change_percentage_24h_desc&per_page=15');
+        const res = await axios.get('https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=15');
+        
+        // Smart Filter: 2% to 10% movement only (Smart Money range)
+        const coin = res.data.find(c => c.price_change_percentage_24h > 2 && c.price_change_percentage_24h < 10);
+
+        if (coin) {
+            const symbol = coin.symbol.toUpperCase();
+            const usdtAmount = balance - 0.1; // Use almost full balance to pass min-order limits
             
-            // Filter: 5% to 12% (Momentum without the Overpump Trap)
-            const pick = market.data.find(c => c.price_change_percentage_24h > 5 && c.price_change_percentage_24h < 12);
-            
-            if (pick) {
-                const symbol = pick.symbol.toUpperCase();
-                const tradeAmount = balance.toFixed(2); // Use full current balance to meet exchange minimums
-                
-                const bought = await placeOrder(symbol, "buy", tradeAmount);
-                if (bought) {
-                    activeTrades.push({
-                        symbol,
-                        entryPrice: pick.current_price,
-                        amount: tradeAmount
-                    });
-                }
+            const bought = await placeOrder(symbol, "buy", usdtAmount);
+            if (bought) {
+                activeTrades.push({ symbol, entryPrice: bought.price, usdtAmount, quantity: bought.quantity });
             }
-        } catch (e) { console.error("Market Data Unavailable"); }
+        }
     }
 };
 
-// 5-Minute loop to stay under rate limits
 cron.schedule('*/5 * * * *', tradeEngine);
+app.get('/', (req, res) => res.json({ status: "ALIVE", active: activeTrades }));
 app.listen(process.env.PORT || 3000);
