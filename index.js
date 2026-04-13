@@ -33,3 +33,9 @@ const runMultiScanner = async () => {
     }
     console.log(`--- 🏁 SCAN COMPLETE ---`);
 };
+// Add this at the bottom of your file
+const PORT = process.env.PORT || 3000;
+app.get('/', (req, res) => res.send('Bot is Running 🚀'));
+app.listen(PORT, () => {
+    console.log(`✅ Server is live on port ${PORT}`);
+});
