@@ -52,13 +52,15 @@ const runMultiScanner = async () => {
             const rsi = RSI.calculate({ values: prices, period: 14 }).pop();
             const ema9 = EMA.calculate({ values: prices, period: 9 }).pop();
             const ema21 = EMA.calculate({ values: prices, period: 21 }).pop();
-
-            // BETTER SIGNAL: RSI < 35 + EMA Trend Confirmation
-            if (rsi < 35 && ema9 > ema21) {
+const volumes = res.data.map(d => parseFloat(d[5]));
+const avgVolume = volumes.slice(-10).reduce((a,b)=>a+b,0)/10;
+const currentVolume = volumes[volumes.length - 1];
+            // BETTER SIGNAL: RSI < 45 + EMA Trend Confirmation
+            if (rsi < 45 && ema9 > ema21) {
                 console.log(`🎯 SIGNAL: ${coin} RSI:${rsi.toFixed(2)} | Trend: UP`);
                 
                 // COMPOUNDING: Use 95% of current balance for trade
-                const tradeAmount = (balance * 0.95).toFixed(2);
+                const tradeAmount = (balance * 0.60).toFixed(2);
                 
                 const bought = await executeOrder("buy", coin, tradeAmount);
                 if (bought) {
@@ -91,12 +93,12 @@ async function checkTrailingExit(trade) {
         const totalGain = ((currentPrice - trade.entry) / trade.entry) * 100;
 
         // EXIT LOGIC: 
-        // 1. If up 1.5%, sell if price drops 0.5% from the top (Trailing)
-        // 2. Strict Stop Loss at -1.2%
-        if ((totalGain > 1.5 && dropFromTop > 0.5) || totalGain <= -1.2) {
+        // 1. If up 0.7%, sell if price drops 0.3% from the top (Trailing)
+        // 2. Strict Stop Loss at -0.8%
+        if ((totalGain > 0.7 && dropFromTop > 0.3) || totalGain <= -0.8) {
             console.log(`🚪 EXITING: ${trade.symbol} | Gain: ${totalGain.toFixed(2)}%`);
             const sold = await executeOrder("sell", trade.symbol, (trade.qty * currentPrice).toFixed(2));
-            if (sold) activeTrade = null;
+            if (sold) activeTrade = [];
         }
     } catch (e) { console.log("Exit check failed"); }
 }
