@@ -5,7 +5,7 @@ const crypto = require('crypto');
 require('dotenv').config();
 
 const app = express();
-let activeTrades = []; 
+let sniperPosition = null; // Memory to track our active hunt
 
 const sign = (body) => {
     const payload = Buffer.from(JSON.stringify(body)).toString();
@@ -23,7 +23,7 @@ const getBalance = async () => {
     } catch (err) { return 0; }
 };
 
-const placeOrder = async (symbol, side, usdtAmount) => {
+const sniperTrade = async (symbol, side, usdtAmount) => {
     try {
         const priceRes = await axios.get(`https://api.binance.com/api/v3/ticker/price?symbol=${symbol}USDT`);
         const price = parseFloat(priceRes.data.price);
@@ -41,50 +41,52 @@ const placeOrder = async (symbol, side, usdtAmount) => {
             headers: { 'X-AUTH-APIKEY': process.env.COINDCX_API_KEY, 'X-AUTH-SIGNATURE': sign(body) }
         });
 
-        console.log(`🚀 ${side.toUpperCase()} SUCCESS: ${symbol} @ ${price}`);
+        console.log(`🎯 SNIPER ${side.toUpperCase()}: ${symbol} at ${price}`);
         return { price, quantity };
     } catch (err) {
-        console.error(`❌ EXECUTION FAILED: ${err.response?.data?.message || err.message}`);
+        console.error(`❌ Sniper Missed: ${err.response?.data?.message || err.message}`);
         return null;
     }
 };
 
-const forceTrade = async () => {
-    console.log("⚡ FORCE SCANNING FOR IMMEDIATE ENTRY...");
+const runSniper = async () => {
+    console.log("⚡ SNIPER SCANNING...");
 
-    // 1. Manage existing trades
-    for (let i = activeTrades.length - 1; i >= 0; i--) {
-        const trade = activeTrades[i];
-        const priceRes = await axios.get(`https://api.binance.com/api/v3/ticker/price?symbol=${trade.symbol}USDT`);
+    // 1. EXIT SYSTEM (The 'Take Profit' or 'Cut Loss')
+    if (sniperPosition) {
+        const priceRes = await axios.get(`https://api.binance.com/api/v3/ticker/price?symbol=${sniperPosition.symbol}USDT`);
         const currentPrice = parseFloat(priceRes.data.price);
-        const pnl = ((currentPrice - trade.entryPrice) / trade.entryPrice) * 100;
+        const pnl = ((currentPrice - sniperPosition.entryPrice) / sniperPosition.entryPrice) * 100;
+
+        console.log(`📊 Sniper Tracking ${sniperPosition.symbol}: ${pnl.toFixed(2)}%`);
         
-        console.log(`📊 Tracking ${trade.symbol}: ${pnl.toFixed(2)}%`);
-        if (pnl >= 10 || pnl <= -4) {
-            const sold = await placeOrder(trade.symbol, "sell", trade.usdtAmount);
-            if (sold) activeTrades.splice(i, 1);
+        // Target high-growth (12% profit) or fast exit (-4% loss)
+        if (pnl >= 12 || pnl <= -4) {
+            const sold = await sniperTrade(sniperPosition.symbol, "sell", sniperPosition.usdtAmount);
+            if (sold) sniperPosition = null;
         }
+        return;
     }
 
-    // 2. FORCE BUY (If wallet has 1.92 USDT and no open trades)
+    // 2. ENTRY SYSTEM (The 'Snipe')
     const balance = await getBalance();
-    if (balance > 1.2 && activeTrades.length === 0) {
-        const res = await axios.get('https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=price_change_percentage_24h_desc&per_page=5');
+    if (balance > 1.2) {
+        const market = await axios.get('https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=price_change_percentage_24h_desc&per_page=10');
         
-        // Grab the #1 gainer regardless of strict filters to force action
-        const topCoin = res.data[0];
-        const symbol = topCoin.symbol.toUpperCase();
-        const tradeAmt = (balance - 0.05).toFixed(2); 
-
-        console.log(`🔥 Forcing Buy on ${symbol} to trigger execution...`);
-        const bought = await placeOrder(symbol, "buy", tradeAmt);
-        if (bought) {
-            activeTrades.push({ symbol, entryPrice: bought.price, usdtAmount: tradeAmt });
+        // Pick the top volatility coin (excluding extreme pumps over 25%)
+        const target = market.data.find(c => c.price_change_percentage_24h < 25);
+        if (target) {
+            const symbol = target.symbol.toUpperCase();
+            const amount = (balance - 0.05).toFixed(2);
+            
+            const bought = await sniperTrade(symbol, "buy", amount);
+            if (bought) {
+                sniperPosition = { symbol, entryPrice: bought.price, usdtAmount: amount };
+            }
         }
     }
 };
 
-// 5-min interval to avoid 429 errors
-cron.schedule('*/5 * * * *', forceTrade);
-app.get('/', (req, res) => res.json({ status: "ACTIVE", trades: activeTrades }));
+// 5-minute cooldown to avoid API blocks
+cron.schedule('*/5 * * * *', runSniper);
 app.listen(process.env.PORT || 3000);
