@@ -1,26 +1,31 @@
+const { GoogleGenerativeAI } = require("@google/generative-ai");
 const express = require('express');
 const axios = require('axios');
 const cron = require('node-cron');
-const crypto = require('crypto');
 require('dotenv').config();
 
 const app = express();
-app.use(express.json());
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-// 6:00 PM to 7:00 PM SAFETY WINDOW (IST)
-// This liquidates assets to your wallet daily
-cron.schedule('0 18 * * *', async () => {
-    console.log("6 PM IST: Safety window active. Cash out to wallet.");
-});
-
-// AUTO-TRADE ENGINE (Targeting 30% profit / 7% loss)
+// Bot Logic: Scanning every 5 minutes
 cron.schedule('*/5 * * * *', async () => {
-    console.log("AI Scanning for high-probability trades...");
-    // AI and CoinDCX logic goes here
+    console.log('--- Gemini AI Scanning for high-probability trades ---');
+    try {
+        const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+        const prompt = "Analyze the current BTC and ETH market trend. Should I Buy, Sell, or Hold? Return only the action.";
+        
+        const result = await model.generateContent(prompt);
+        const response = await result.response;
+        console.log("AI Decision:", response.text());
+        
+        // Your CoinDCX logic will trigger based on the decision above
+    } catch (error) {
+        console.error("Scanning Error:", error.message);
+    }
 });
 
 app.get('/', (req, res) => {
-    res.send('CryptoGrowth AI Engine is Active and Scanning.');
+    res.send('<h1>CryptoGrowth AI Engine (Free Edition) is Active</h1>');
 });
 
 const PORT = process.env.PORT || 3000;
