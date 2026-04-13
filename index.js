@@ -8,80 +8,66 @@ require('dotenv').config();
 const app = express();
 let activeTrade = null; 
 
-// --- UPGRADED CONFIG ---
-const SYMBOL = 'SOL'; 
-const STOP_LOSS_PCT = 1.2;    // Tighter stop loss to protect ₹100 capital
-const TAKE_PROFIT_PCT = 2.5;  // Real-world scalping target
-const TRAILING_OFFSET = 0.5;  // Trailing profit protection
+// --- MULTI-CURRENCY CONFIG ---
+const WATCHLIST = ['SOL', 'BTC', 'ETH', 'DOGE', 'MATIC', 'ADA', 'XRP']; 
+const STOP_LOSS_PCT = 1.2;
+const TAKE_PROFIT_PCT = 2.5;
 
 const signDCX = (body) => {
     const payload = Buffer.from(JSON.stringify(body)).toString();
     return crypto.createHmac('sha256', process.env.COINDCX_SECRET_KEY).update(payload).digest('hex');
 };
 
-// --- NEW: COMPOUNDING ENGINE ---
-// This automatically uses your growing balance for the next trade
-async function getCompoundAmount() {
+async function getOhlcv(symbol) {
     try {
-        const body = { timestamp: Date.now() };
-        const res = await axios.post('https://api.coindcx.com/exchange/v1/users/balances', body, {
-            headers: { 'X-AUTH-APIKEY': process.env.COINDCX_API_KEY, 'X-AUTH-SIGNATURE': signDCX(body) }
-        });
-        const usdt = res.data.find(b => b.currency === 'USDT' || b.asset === 'USDT');
-        const balance = parseFloat(usdt.balance);
-        return (balance * 0.98).toFixed(2); // Use 98% of balance (leaves 2% for fees/TDS)
-    } catch (e) { return 1.87; }
+        const res = await axios.get(`https://api.binance.com/api/v3/klines?symbol=${symbol}USDT&interval=1m&limit=50`);
+        return res.data.map(d => parseFloat(d[4]));
+    } catch (e) { return null; }
 }
 
-const runApexEngine = async () => {
-    try {
-        const res = await axios.get(`https://api.binance.com/api/v3/klines?symbol=${SYMBOL}USDT&interval=1m&limit=100`);
-        const prices = res.data.map(d => parseFloat(d[4]));
-        
+const runMultiScanner = async () => {
+    // If we are already in a trade, only monitor that specific trade for EXIT
+    if (activeTrade) {
+        await checkExit(activeTrade);
+        return;
+    }
+
+    console.log(`🔍 Scanning Watchlist: ${WATCHLIST.join(', ')}`);
+
+    for (const coin of WATCHLIST) {
+        const prices = await getOhlcv(coin);
+        if (!prices) continue;
+
         const rsi = RSI.calculate({ values: prices, period: 14 }).pop();
         const ema9 = EMA.calculate({ values: prices, period: 9 }).pop();
         const ema21 = EMA.calculate({ values: prices, period: 21 }).pop();
         const currentPrice = prices[prices.length - 1];
 
-        console.log(`🤖 [APEX] ${SYMBOL}: ${currentPrice} | RSI: ${rsi.toFixed(2)} | EMA9: ${ema9.toFixed(2)}`);
-
-        // --- UPGRADED BUY LOGIC (Trend Confirmation) ---
-        if (!activeTrade && rsi < 32 && ema9 > ema21) {
-            const amount = await getCompoundAmount();
-            console.log(`🚀 SIGNAL: RSI Oversold + EMA Cross. Buying with ${amount} USDT...`);
-            
-            const bought = await executeOrder("buy", SYMBOL, amount);
+        // --- DYNAMIC SIGNAL DETECTION ---
+        if (rsi < 30 && ema9 > ema21) {
+            console.log(`🎯 SIGNAL DETECTED for ${coin}! RSI: ${rsi.toFixed(2)}`);
+            const bought = await executeOrder("buy", coin, 1.88); // Use ~1.88 to clear 2 USDT with fees
             if (bought) {
-                activeTrade = { 
-                    symbol: SYMBOL, 
-                    entry: bought.price, 
-                    qty: bought.qty, 
-                    highestPrice: bought.price 
-                };
+                activeTrade = { symbol: coin, entry: bought.price, qty: bought.qty };
+                break; // Stop scanning once we enter a trade
             }
         }
-
-        // --- UPGRADED SELL LOGIC (Trailing Stop) ---
-        if (activeTrade) {
-            const pnl = ((currentPrice - activeTrade.entry) / activeTrade.entry) * 100;
-            
-            // Track highest price for trailing stop
-            if (currentPrice > activeTrade.highestPrice) activeTrade.highestPrice = currentPrice;
-            const dropFromPeak = ((activeTrade.highestPrice - currentPrice) / activeTrade.highestPrice) * 100;
-
-            // Exit conditions: Target hit + Trailing, Stop Loss, or Indicator Flip
-            const exitSignal = (pnl >= TAKE_PROFIT_PCT && dropFromPeak >= TRAILING_OFFSET) || 
-                               (pnl <= -STOP_LOSS_PCT) || 
-                               (rsi > 75);
-
-            if (exitSignal) {
-                console.log(`💰 EXIT: Closing with ${pnl.toFixed(2)}% PnL`);
-                const sold = await executeOrder("sell", SYMBOL, (activeTrade.qty * currentPrice).toFixed(2));
-                if (sold) activeTrade = null;
-            }
-        }
-    } catch (err) { console.log("Engine Pause:", err.message); }
+    }
 };
+
+async function checkExit(trade) {
+    const prices = await getOhlcv(trade.symbol);
+    const currentPrice = prices[prices.length - 1];
+    const pnl = ((currentPrice - trade.entry) / trade.entry) * 100;
+
+    console.log(`📈 Monitoring [${trade.symbol}] | PnL: ${pnl.toFixed(2)}%`);
+
+    if (pnl >= TAKE_PROFIT_PCT || pnl <= -STOP_LOSS_PCT) {
+        console.log(`💰 EXITING ${trade.symbol}...`);
+        const sold = await executeOrder("sell", trade.symbol, (trade.qty * currentPrice).toFixed(2));
+        if (sold) activeTrade = null;
+    }
+}
 
 async function executeOrder(side, symbol, amount) {
     try {
@@ -95,10 +81,10 @@ async function executeOrder(side, symbol, amount) {
         });
         return { price, qty };
     } catch (err) {
-        console.log(`❌ Order Blocked: ${err.response?.data?.message || "Check Balance"}`);
+        console.log(`❌ ${symbol} Order Failed: ${err.response?.data?.message || "Check Balance"}`);
         return null;
     }
 }
 
-cron.schedule('*/1 * * * *', runApexEngine);
+cron.schedule('*/1 * * * *', runMultiScanner);
 app.listen(process.env.PORT || 3000);
