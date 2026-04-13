@@ -8,40 +8,15 @@ require('dotenv').config();
 const app = express();
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-const getUSDTBalance = async () => {
-    try {
-        const timeStamp = Date.now();
-        const body = { "timestamp": timeStamp };
-        const payload = Buffer.from(JSON.stringify(body)).toString();
-        const signature = crypto.createHmac('sha256', process.env.COINDCX_SECRET_KEY).update(payload).digest('hex');
-
-        const res = await axios.post('https://api.coindcx.com/exchange/v1/users/balances', body, {
-            headers: {
-                'X-AUTH-APIKEY': process.env.COINDCX_API_KEY,
-                'X-AUTH-SIGNATURE': signature
-            }
-        });
-
-        // This improved check finds USDT regardless of how CoinDCX labels it
-        const usdtAsset = res.data.find(b => b.currency === 'USDT' || b.asset === 'USDT');
-        const balance = usdtAsset ? parseFloat(usdtAsset.balance) : 0;
-        
-        console.log(`Current Wallet Balance: ${balance} USDT`);
-        return balance; 
-    } catch (err) {
-        console.log("Searching for USDT balance...");
-        return 0;
-    }
-};
-
-const placeUSDTOrder = async (coinSymbol, amount) => {
+// 1. Function to place the actual trade
+const placeOrder = async (coinSymbol) => {
     try {
         const timeStamp = Date.now();
         const body = {
             "side": "buy",
             "order_type": "market_order",
-            "market": `${coinSymbol}USDT`,
-            "total_quantity": amount, 
+            "market": `${coinSymbol}INR`,
+            "total_quantity": 100, // Fixed amount for the ₹100 challenge
             "timestamp": timeStamp
         };
 
@@ -54,39 +29,66 @@ const placeUSDTOrder = async (coinSymbol, amount) => {
                 'X-AUTH-SIGNATURE': signature
             }
         });
-        console.log(`🚀 SUCCESS: Bot bought ${coinSymbol} using ${amount} USDT!`);
+        console.log(`🚀 SUCCESS: Bought ${coinSymbol}! Order ID: ${res.data.id}`);
     } catch (err) {
-        console.log(`❌ Trade execution failed:`, err.response ? err.response.data : err.message);
+        console.log(`❌ Trade Failed for ${coinSymbol}:`, err.response ? err.response.data : err.message);
+    }
+};
+
+const getBalance = async () => {
+    try {
+        const timeStamp = Date.now();
+        const body = { "timestamp": timeStamp };
+        const payload = Buffer.from(JSON.stringify(body)).toString();
+        const signature = crypto.createHmac('sha256', process.env.COINDCX_SECRET_KEY).update(payload).digest('hex');
+
+        const res = await axios.post('https://api.coindcx.com/exchange/v1/users/balances', body, {
+            headers: {
+                'X-AUTH-APIKEY': process.env.COINDCX_API_KEY,
+                'X-AUTH-SIGNATURE': signature
+            }
+        });
+        const inr = res.data.find(b => b.currency === 'INR' || b.asset === 'INR');
+        const balance = inr ? parseFloat(inr.balance) : 0;
+        console.log(`Wallet Balance: ₹${balance}`);
+        return balance >= 100;
+    } catch (err) {
+        console.log("Syncing Wallet...");
+        return false;
     }
 };
 
 const runTradeEngine = async () => {
-    console.log(`--- USDT Scalp Cycle: ${new Date().toLocaleTimeString()} ---`);
-    const balance = await getUSDTBalance();
+    console.log(`--- Scalp Scan: ${new Date().toLocaleTimeString()} ---`);
+    const hasFunds = await getBalance();
     
-    if (balance < 1) {
-        console.log("Balance too low or wallet empty. Ensure 1+ USDT is in 'Coins'.");
+    if (!hasFunds) {
+        console.log("Waiting for INR in Coins Wallet...");
         return;
     }
 
     try {
-        const marketData = await axios.get('https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=price_change_percentage_24h_desc&per_page=10');
-        const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+        const marketData = await axios.get('https://api.coingecko.com/api/v3/coins/markets?vs_currency=inr&order=price_change_percentage_24h_desc&per_page=10');
+        const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
         
-        const prompt = `Act as an aggressive crypto trader. Pick the ONE coin with the highest 5-minute pump potential. Return ONLY JSON: {"coin": "SYMBOL"}. Data: ${JSON.stringify(marketData.data.slice(0,3))}`;
+        const prompt = `You are an aggressive scalper. Pick the ONE best coin to buy NOW for 30% profit. 
+        Return ONLY JSON format: {"coin": "SYMBOL"} (e.g. {"coin": "SOL"}). 
+        Data: ${JSON.stringify(marketData.data.slice(0,5))}`;
 
         const result = await model.generateContent(prompt);
         const decision = JSON.parse(result.response.text().trim());
 
         if (decision.coin) {
-            console.log(`🎯 AI Strategy: Buy ${decision.coin}. Executing...`);
-            await placeUSDTOrder(decision.coin.toUpperCase(), balance);
+            console.log(`🎯 AI Selected: ${decision.coin}. Executing Market Buy...`);
+            await placeOrder(decision.coin.toUpperCase());
         }
     } catch (error) {
-        console.log("AI is analyzing market volatility...");
+        console.log("Engine paused or parsing error. Retrying next cycle.");
     }
 };
 
+// Runs every 5 minutes
 cron.schedule('*/5 * * * *', runTradeEngine);
-app.get('/', (req, res) => res.send("Bot Status: Active and Watching USDT"));
+
+app.get('/', (req, res) => res.send("Auto-Trader Live"));
 app.listen(process.env.PORT || 3000);
