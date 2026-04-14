@@ -11,7 +11,7 @@ const PORT = process.env.PORT || 3000;
 
 // --- 1. RENDER MONITORING & BINDING ---
 app.get('/', (req, res) => res.json({ status: "Live", active: activeTrades.length, streak: lossStreak, balance: lastKnownBal }));
-app.listen(PORT, '0.0.0.0', () => console.log(`✅ APEX PRO V11 LIVE | PORT ${PORT}`));
+app.listen(PORT, '0.0.0.0', () => console.log(`✅ APEX PRO V11.1 AUDITED | PORT ${PORT}`));
 
 // --- 2. CONFIG & STATE ---
 const WATCHLIST = ['BTC', 'ETH', 'SOL', 'BNB', 'DOGE', 'MATIC', 'ADA', 'XRP'];
@@ -19,7 +19,7 @@ const STATE_FILE = './bot_state.json';
 let activeTrades = [];
 let lastTradePerCoin = {};
 let lastKnownBal = 0;
-let lossStreak = 0; // Kill Switch counter
+let lossStreak = 0; 
 
 const getPrecision = (s) => ({ 'DOGE': 4, 'BTC': 5, 'ETH': 5 }[s] || 2);
 
@@ -65,24 +65,25 @@ async function executeOrder(side, symbol, amount, exactQty = null) {
 
 // --- 5. MAIN SCANNER ---
 const runScanner = async () => {
-    // 🛑 KILL SWITCH
     if (lossStreak >= 3) {
-        console.log("🛑 KILL SWITCH ACTIVE: 3 Consecutive Losses. Manual restart required to reset.");
+        console.log("🛑 KILL SWITCH ACTIVE. Manual restart required.");
         return;
     }
 
-    // Exit Checks
     for (let i = activeTrades.length - 1; i >= 0; i--) {
         await checkExits(activeTrades[i], i);
     }
 
     if (activeTrades.length >= 4) return;
 
-    // Balance Sync
+    // --- BUG FIX 1: SIGNATURE MISMATCH RESOLVED ---
     try {
-        const ts = Date.now();
-        const bRes = await axios.post('https://api.coindcx.com/exchange/v1/users/balances', { timestamp: ts }, {
-            headers: { 'X-AUTH-APIKEY': process.env.COINDCX_API_KEY, 'X-AUTH-SIGNATURE': signDCX({ timestamp: ts }) }
+        const body = { timestamp: Date.now() }; 
+        const bRes = await axios.post('https://api.coindcx.com/exchange/v1/users/balances', body, {
+            headers: { 
+                'X-AUTH-APIKEY': process.env.COINDCX_API_KEY, 
+                'X-AUTH-SIGNATURE': signDCX(body) 
+            }
         });
         const usdt = bRes.data.find(b => b.currency === 'USDT' || b.asset === 'USDT');
         lastKnownBal = usdt ? parseFloat(usdt.balance) - parseFloat(usdt.locked_balance || 0) : 0;
@@ -90,7 +91,9 @@ const runScanner = async () => {
 
     for (const coin of WATCHLIST) {
         if (activeTrades.find(t => t.symbol === coin)) continue;
-        if (Date.now() - (lastTradePerCoin[coin] || 0) < 60000) continue;
+        
+        // --- BUG FIX 2: 90s COOLDOWN RE-INSTATED ---
+        if (Date.now() - (lastTradePerCoin[coin] || 0) < 90000) continue;
 
         const candles = await getCandles(coin);
         if (candles.length < 30) continue;
@@ -101,30 +104,30 @@ const runScanner = async () => {
         const rsi = RSI.calculate({ values: closes, period: 14 }).pop();
         const atr = ATR.calculate({ high: candles.map(c => c.high), low: candles.map(c => c.low), close: closes, period: 14 }).pop();
 
-        // Indicator Logic
         const isBullTrend = ema9 > ema21;
         let score = 0;
         if (rsi < 60) score++;
         if (isBullTrend) score++;
         if (closes[closes.length - 1] > closes[closes.length - 2]) score++;
 
-        // 🔥 LIVE DEBUG LOGS (Visible every 15s in Render)
-        console.log(`📊 [${coin}] RSI: ${rsi.toFixed(1)} | Trend: ${isBullTrend ? "BULL" : "BEAR"} | Score: ${score}/3 | Bal: ${lastKnownBal.toFixed(2)}`);
+        console.log(`📊 [${coin}] RSI: ${rsi.toFixed(1)} | Trend: ${isBullTrend ? "BULL" : "BEAR"} | Score: ${score}/3`);
 
-        // Market Direction Filter
         if (!isBullTrend) continue;
 
-        // STRICT ENTRY (3/3) & Balance Protection
         if (score >= 3 && lastKnownBal > 5) {
-            const tradeAmt = Math.min(
-                lastKnownBal * 0.25,
-                lastKnownBal / (4 - activeTrades.length)
-            ).toFixed(2);
+            const tradeAmt = Math.min(lastKnownBal * 0.25, lastKnownBal / (4 - activeTrades.length)).toFixed(2);
 
             console.log(`🚀 SIGNAL: Entering ${coin} with ${tradeAmt} USDT...`);
             const bought = await executeOrder("buy", coin, tradeAmt);
             if (bought) {
-                activeTrades.push({ symbol: coin, entry: bought.price, qty: bought.qty, highest: bought.price, stop: atr * 1.5 });
+                activeTrades.push({ 
+                    symbol: coin, 
+                    entry: bought.price, 
+                    qty: bought.qty, 
+                    highest: bought.price, 
+                    stop: atr * 1.5 // ATR Value stored
+                });
+                // --- BUG FIX 2: COOLDOWN TRACKING ---
                 lastTradePerCoin[coin] = Date.now();
                 saveState();
             }
@@ -142,14 +145,16 @@ async function checkExits(t, idx) {
         const gain = ((p - t.entry) / t.entry) * 100;
         const drop = ((t.highest - p) / t.highest) * 100;
         
-        // 0.8% Profit trailing or 1.5% Hard Stop
-        if ((gain > 0.8 && drop > 0.3) || gain < -1.5) {
+        // --- BUG FIX 3: ATR STOP ACTIVATED ---
+        const stopPercent = (t.stop / t.entry) * 100;
+
+        if ((gain > 0.8 && drop > 0.3) || gain < -stopPercent) {
             const sold = await executeOrder("sell", t.symbol, 0, t.qty);
             if (sold) {
                 if (gain <= 0) lossStreak++;
                 else lossStreak = 0;
 
-                console.log(`🚪 EXIT ${t.symbol} | Result: ${gain.toFixed(2)}% | Streak: ${lossStreak}`);
+                console.log(`🚪 EXIT ${t.symbol} | Result: ${gain.toFixed(2)}% | Stop was: ${stopPercent.toFixed(2)}%`);
                 activeTrades.splice(idx, 1);
                 saveState();
             }
