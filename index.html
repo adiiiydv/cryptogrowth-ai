@@ -1,84 +1,87 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <title>Apex Pro v11.5</title>
+  <title>Apex Pro v11.6 Dashboard</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <style>
-    body { background: #0f172a; color: white; font-family: sans-serif; padding: 20px; }
-    .grid { display: grid; grid-template-columns: 2fr 1fr; gap: 20px; max-width: 1200px; margin: auto; }
-    .card { background: #1e293b; padding: 20px; border-radius: 12px; }
-    .stat { font-size: 1.2rem; margin: 10px 0; color: #38bdf8; }
-    .trade-row { border-bottom: 1px solid #334155; padding: 10px 0; display: flex; justify-content: space-between; }
-    h2 { color: #38bdf8; margin-top:0; }
+    body { background: #0b0f1a; color: #e2e8f0; font-family: 'Inter', sans-serif; padding: 20px; }
+    .grid { display: grid; grid-template-columns: 2fr 1fr; gap: 20px; max-width: 1300px; margin: auto; }
+    .card { background: #161b22; padding: 20px; border-radius: 12px; border: 1px solid #30363d; }
+    .stat-val { font-size: 1.5rem; font-weight: bold; color: #38bdf8; }
+    .pnl-pos { color: #4ade80; } .pnl-neg { color: #f87171; }
+    .trade-card { background: #0d1117; padding: 15px; margin: 10px 0; border-radius: 8px; border-left: 4px solid #38bdf8; }
+    h2 { color: #38bdf8; margin: 0 0 15px 0; font-size: 1.2rem; }
   </style>
 </head>
 <body>
   <div class="grid">
     <div class="card">
-      <h2>📈 Live Market Data</h2>
-      <select id="coinSelect" style="padding:10px; border-radius:5px; margin-bottom:15px;">
-        <option>BTC</option><option>ETH</option><option>SOL</option><option>BNB</option>
-        <option>DOGE</option><option>MATIC</option><option>ADA</option><option>XRP</option>
-      </select>
+      <h2>📈 Market Analysis <select id="coinSelect" style="float:right; background:#0d1117; color:white; border:1px solid #30363d; padding:5px;"><option>BTC</option><option>ETH</option><option>SOL</option><option>BNB</option><option>DOGE</option><option>MATIC</option><option>ADA</option><option>XRP</option></select></h2>
       <canvas id="priceChart"></canvas>
-      <canvas id="rsiChart"></canvas>
     </div>
-
     <div class="card">
-      <h2>💼 Active Portfolio</h2>
-      <div id="balance" class="stat">Balance: $0.00</div>
-      <div id="streak" class="stat" style="color:#f87171">Loss Streak: 0/5</div>
-      <hr style="border-color:#334155">
+      <h2>💼 Active Trades & PnL</h2>
+      <div id="balance" class="stat-val">$0.00</div>
+      <div id="streak" style="margin-bottom:20px; color:#8b949e;">Streak: 0/5</div>
       <div id="tradeList"></div>
     </div>
   </div>
 
   <script>
-    let priceChart, rsiChart;
+    let priceChart;
     async function update() {
         const coin = document.getElementById("coinSelect").value;
-        
-        // Update Indicators
         const iRes = await fetch(`/indicators/${coin}`);
         const iData = await iRes.json();
+        
         if(iData.closes) {
             const labels = iData.closes.map((_, i) => i);
             if(priceChart) priceChart.destroy();
-            if(rsiChart) rsiChart.destroy();
             
+            // Marker Logic: If we are in a trade, add an entry line
+            const datasets = [
+                { label: 'Price', data: iData.closes, borderColor: '#38bdf8', pointRadius: 0 },
+                { label: 'EMA 9', data: iData.ema9, borderColor: '#fbbf24', borderDash:[5,5], pointRadius: 0 },
+                { label: 'EMA 21', data: iData.ema21, borderColor: '#f87171', pointRadius: 0 }
+            ];
+
+            if(iData.activeEntry) {
+                datasets.push({
+                    label: 'ENTRY',
+                    data: new Array(iData.closes.length).fill(iData.activeEntry),
+                    borderColor: '#4ade80',
+                    borderDash: [2, 2],
+                    pointRadius: 0,
+                    borderWidth: 2
+                });
+            }
+
             priceChart = new Chart(document.getElementById("priceChart"), {
                 type: 'line',
-                data: { labels, datasets: [
-                    { label: 'Price', data: iData.closes, borderColor: '#38bdf8' },
-                    { label: 'EMA 9', data: iData.ema9, borderColor: '#fbbf24', borderDash:[5,5] },
-                    { label: 'EMA 21', data: iData.ema21, borderColor: '#f87171' }
-                ]},
-                options: { plugins: { legend: { labels: { color: 'white' } } } }
-            });
-            
-            rsiChart = new Chart(document.getElementById("rsiChart"), {
-                type: 'line',
-                data: { labels, datasets: [{ label: 'RSI', data: iData.rsi, borderColor: '#4ade80', fill:true, backgroundColor:'rgba(74,222,128,0.1)' }] },
-                options: { plugins: { legend: { labels: { color: 'white' } } } }
+                data: { labels, datasets },
+                options: { animation: false, scales: { y: { grid: { color: '#30363d' } }, x: { display: false } } }
             });
         }
 
-        // Update Trade Data
         const sRes = await fetch('/status');
         const sData = await sRes.json();
-        document.getElementById("balance").innerText = `Balance: $${parseFloat(sData.balance).toFixed(2)}`;
+        document.getElementById("balance").innerText = `$${parseFloat(sData.balance).toFixed(2)}`;
         document.getElementById("streak").innerText = `Loss Streak: ${sData.streak}/5`;
         
-        document.getElementById("tradeList").innerHTML = sData.activeTrades.map(t => `
-            <div class="trade-row">
-                <span><b>${t.symbol}</b></span>
-                <span>$${t.entry.toFixed(2)}</span>
-                <span style="color:#4ade80">Active</span>
-            </div>
-        `).join('');
+        document.getElementById("tradeList").innerHTML = sData.activeTrades.map(t => {
+            return `
+            <div class="trade-card">
+                <div style="display:flex; justify-content:space-between;">
+                    <b>${t.symbol}</b>
+                    <span class="pnl-pos">LIVE</span>
+                </div>
+                <div style="font-size:0.9rem; color:#8b949e; margin-top:5px;">
+                    Entry: $${t.entry.toFixed(4)} | Qty: ${t.qty}
+                </div>
+            </div>`;
+        }).join('');
     }
-    setInterval(update, 10000);
-    update();
+    setInterval(update, 10000); update();
     document.getElementById("coinSelect").addEventListener("change", update);
   </script>
 </body>
