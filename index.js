@@ -1,3 +1,8 @@
+/**
+ * APEX HEDGE v18.0 - FINAL UNIFIED STABLE ARCHITECTURE
+ * Merged Features: v17.4 Mapping + v17.5 Pro-Architecture
+ */
+
 const express = require('express');
 const axios = require('axios');
 const crypto = require('crypto');
@@ -9,158 +14,169 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// ================= CONFIG =================
-const STATE_FILE = './state.json';
-const WATCHLIST = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'DOGEUSDT', 'MATICUSDT'];
-const ALLOCATION_PCT = 0.70;
-const STOP_LOSS_PCT = 1.5;
-const TAKE_PROFIT_PCT = 2.5;
+// --- 1. CONFIGURATION & RISK MANAGEMENT ---
+const CONFIG = {
+    STATE_FILE: './state.json',
+    WATCHLIST: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'DOGEUSDT', 'MATICUSDT'],
+    ALLOCATION_PCT: 0.70,
+    STOP_LOSS_PCT: 1.5,
+    TAKE_PROFIT_PCT: 2.5,
+    MARKET_CACHE_TTL: 60000, // 1 Minute
+    MIN_TRADE_USDT: 2.0      // Buffer to avoid "Min Order" rejections
+};
 
 let activeTrades = [];
 let lastKnownBal = 0;
 let isRunning = false;
+let marketCache = { data: null, timestamp: 0 };
 
-// ================= LOAD STATE =================
-if (fs.existsSync(STATE_FILE)) {
+// Safe State Recovery
+if (fs.existsSync(CONFIG.STATE_FILE)) {
     try {
-        activeTrades = JSON.parse(fs.readFileSync(STATE_FILE));
-    } catch {
+        activeTrades = JSON.parse(fs.readFileSync(CONFIG.STATE_FILE));
+    } catch (e) {
+        console.error("⚠️ State file corrupted. Initializing fresh.");
         activeTrades = [];
     }
 }
 
+// --- 2. UTILITY & SECURITY ---
 const log = (m) => console.log(`[${new Date().toLocaleTimeString()}] ${m}`);
 
-const sign = (body) =>
+const sign = (body) => 
     crypto.createHmac('sha256', process.env.COINDCX_SECRET_KEY)
         .update(JSON.stringify(body))
         .digest('hex');
 
-// ================= SAFE GET =================
-async function safeGet(url, timeout = 30000) {
+/**
+ * Enhanced Safe Request with Retry Logic
+ */
+async function safeGet(url, timeout = 25000, retries = 2) {
     try {
         const res = await axios.get(url, { timeout });
         return res?.data || null;
     } catch (e) {
+        if (retries > 0) {
+            await new Promise(r => setTimeout(r, 2000));
+            return safeGet(url, timeout, retries - 1);
+        }
         return null;
     }
 }
 
-// ================= ORDER ENGINE (V17.4 FIX) =================
+// --- 3. MARKET ENGINE (COINDCX MAPPING) ---
+async function getMarkets() {
+    const now = Date.now();
+    if (marketCache.data && (now - marketCache.timestamp < CONFIG.MARKET_CACHE_TTL)) {
+        return marketCache.data;
+    }
+    const data = await safeGet('https://public.coindcx.com/exchange/ticker');
+    if (Array.isArray(data)) {
+        marketCache = { data, timestamp: now };
+    }
+    return marketCache.data || [];
+}
+
+/**
+ * Robust Order Engine with Fuzzy Mapping
+ */
 async function placeOrder(side, symbol, amount, qtyOverride = null) {
     try {
         const coin = symbol.replace("USDT", "");
+        const markets = await getMarkets();
         
-        // 1. Fetch Fresh Ticker
-        const tickerData = await safeGet('https://public.coindcx.com/exchange/ticker');
-        if (!Array.isArray(tickerData)) {
-            log(`❌ Ticker fetch failed`);
-            return null;
-        }
-
-        // 2. AGGRESSIVE MAPPING: Look for any market matching the coin + USDT
-        // CoinDCX uses different patterns: BTCUSDT, B-BTC_USDT, or BTC_USDT
-        const market = tickerData.find(m => 
+        // v17.4 Aggressive Mapping Strategy
+        const market = markets.find(m => 
             m.market === `${coin}USDT` || 
             m.market === `B-${coin}_USDT` || 
             m.market === `${coin}_USDT`
         );
 
-        if (!market || !market.last_price) {
-            log(`❌ CRITICAL: Could not map ${symbol} to a CoinDCX market.`);
+        if (!market?.last_price) {
+            log(`❌ MAPPING ERROR: ${symbol} pair not found in ticker.`);
             return null;
         }
 
         const price = Number(market.last_price);
-        const qty = qtyOverride 
-            ? Number(qtyOverride.toFixed(5)) 
-            : Number((amount / price).toFixed(5));
+        const qty = qtyOverride ? Number(qtyOverride.toFixed(5)) : Number((amount / price).toFixed(5));
 
         const body = {
             side,
             order_type: "market_order",
-            market: market.market, // Uses the EXACT name from the ticker
+            market: market.market,
             total_quantity: qty,
             timestamp: Date.now()
         };
 
-        log(`🔄 Attempting ${side.toUpperCase()} on ${market.market}...`);
+        log(`🔄 Executing ${side.toUpperCase()} on ${market.market}...`);
 
-        const res = await axios.post(
-            "https://api.coindcx.com/exchange/v1/orders/create",
-            body,
-            {
-                headers: {
-                    "X-AUTH-APIKEY": process.env.COINDCX_API_KEY,
-                    "X-AUTH-SIGNATURE": sign(body),
-                    "Content-Type": "application/json"
-                },
-                timeout: 30000
-            }
-        );
+        const res = await axios.post("https://api.coindcx.com/exchange/v1/orders/create", body, {
+            headers: {
+                "X-AUTH-APIKEY": process.env.COINDCX_API_KEY,
+                "X-AUTH-SIGNATURE": sign(body),
+                "Content-Type": "application/json"
+            },
+            timeout: 30000
+        });
 
         if (res.data && res.data.status !== "error") {
             log(`✅ SUCCESS: ${market.market} @ ${price}`);
             return { price, qty, market: market.market };
-        } else {
-            log(`❌ EXCH REJECT: ${res.data?.message || "Check API Permissions/Balance"}`);
-            return null;
         }
 
+        log(`❌ EXCH REJECT: ${res.data?.message || "Verify Balance/Keys"}`);
+        return null;
     } catch (e) {
-        // If it's a 404, it means the endpoint URL might be wrong or the market name is rejected
-        if (e.response?.status === 404) {
-            log(`❌ 404 ERROR: The exchange endpoint or market name was not found.`);
-        } else {
-            log(`❌ API ERROR: ${e.message}`);
-        }
+        log(`❌ API CRITICAL: ${e.message}`);
         return null;
     }
 }
 
-// ================= SCANNER =================
+// --- 4. ANALYTIC SCANNER (BRAIN) ---
 async function runScanner() {
-    if (isRunning) return;
+    if (isRunning) return; 
     isRunning = true;
 
     try {
+        // Step 1: Sync Account Balance
         const bBody = { timestamp: Date.now() };
         const bRes = await axios.post('https://api.coindcx.com/exchange/v1/users/balances', bBody, {
-            headers: { 
-                "X-AUTH-APIKEY": process.env.COINDCX_API_KEY, 
-                "X-AUTH-SIGNATURE": sign(bBody) 
-            },
+            headers: { "X-AUTH-APIKEY": process.env.COINDCX_API_KEY, "X-AUTH-SIGNATURE": sign(bBody) },
             timeout: 20000
         }).catch(() => null);
         
         const usdt = bRes?.data?.find(b => b.currency === 'USDT' || b.asset === 'USDT');
         lastKnownBal = Number(usdt?.balance || usdt?.available_balance || 0);
 
-        log(`--- SCAN | BAL: $${lastKnownBal.toFixed(2)} | ACTIVE: ${activeTrades.length} ---`);
+        log(`--- HEARTBEAT | BAL: $${lastKnownBal.toFixed(2)} | ACTIVE: ${activeTrades.length} ---`);
 
-        const tickerData = await safeGet('https://public.coindcx.com/exchange/ticker');
-        if (!tickerData) { isRunning = false; return; }
+        const markets = await getMarkets();
+        if (!markets.length) throw new Error("Ticker Down");
 
-        // EXIT LOGIC
+        // Step 2: Exit Monitor (Take Profit / Stop Loss)
         for (let i = activeTrades.length - 1; i >= 0; i--) {
             const t = activeTrades[i];
-            const m = tickerData.find(x => x.market === t.market);
+            const m = markets.find(x => x.market === t.market);
             if (!m) continue;
 
             const price = Number(m.last_price);
             const pnl = ((price - t.entry) / t.entry) * 100;
             
-            if (pnl <= -STOP_LOSS_PCT || pnl >= TAKE_PROFIT_PCT) {
+            log(`📈 TRADE: ${t.symbol.padEnd(8)} | PNL: ${pnl.toFixed(2)}% | Price: ${price}`);
+
+            if (pnl <= -CONFIG.STOP_LOSS_PCT || pnl >= CONFIG.TAKE_PROFIT_PCT) {
+                log(`🚨 EXIT SIGNAL: ${t.symbol}`);
                 const sold = await placeOrder("sell", t.symbol, 0, t.qty);
-                if (sold) { 
-                    activeTrades.splice(i, 1); 
-                    fs.writeFileSync(STATE_FILE, JSON.stringify(activeTrades, null, 2)); 
+                if (sold) {
+                    activeTrades.splice(i, 1);
+                    fs.writeFileSync(CONFIG.STATE_FILE, JSON.stringify(activeTrades, null, 2));
                 }
             }
         }
 
-        // ENTRY LOGIC
-        for (const coin of WATCHLIST) {
+        // Step 3: Entry Scan (Signal Detection)
+        for (const coin of CONFIG.WATCHLIST) {
+            // Skip if already in trade
             if (activeTrades.some(t => t.symbol === coin)) continue;
 
             const candles = await safeGet(`https://api.binance.com/api/v3/klines?symbol=${coin}&interval=1m&limit=40`);
@@ -171,28 +187,37 @@ async function runScanner() {
             const ema9 = EMA.calculate({ values: closes, period: 9 }).pop();
             const ema21 = EMA.calculate({ values: closes, period: 21 }).pop();
 
+            if (!rsi || !ema9 || !ema21) continue;
+
             if (rsi < 60 && ema9 > ema21) {
-                const tradeAmt = lastKnownBal * ALLOCATION_PCT;
-                if (tradeAmt > 1.0) {
+                const tradeAmt = lastKnownBal * CONFIG.ALLOCATION_PCT;
+                if (tradeAmt > CONFIG.MIN_TRADE_USDT) {
+                    log(`🎯 BUY SIGNAL: ${coin} | RSI: ${rsi.toFixed(1)}`);
                     const buy = await placeOrder("buy", coin, tradeAmt);
                     if (buy) {
-                        activeTrades.push({ symbol: coin, market: buy.market, entry: buy.price, qty: buy.qty });
-                        fs.writeFileSync(STATE_FILE, JSON.stringify(activeTrades, null, 2));
+                        activeTrades.push({ 
+                            symbol: coin, 
+                            market: buy.market, 
+                            entry: buy.price, 
+                            qty: buy.qty 
+                        });
+                        fs.writeFileSync(CONFIG.STATE_FILE, JSON.stringify(activeTrades, null, 2));
                     }
                 }
             }
         }
-    } catch (e) { 
-        log(`❌ SCANNER ERROR: ${e.message}`); 
-    } finally { 
-        isRunning = false; 
+    } catch (e) {
+        log(`❌ SCANNER ERROR: ${e.message}`);
+    } finally {
+        isRunning = false;
     }
 }
 
-app.get('/', (_, res) => res.send("BOT v17.4 - MAPPING FIX ACTIVE"));
+// --- 5. SERVER BOOT ---
+app.get('/', (_, res) => res.send({ status: "Live", version: "18.0-Stable", bal: lastKnownBal }));
 
 app.listen(PORT, '0.0.0.0', () => {
-    log(`🚀 v17.4 LIVE | FIXING 404 MAPPING ISSUES`);
-    runScanner();
-    cron.schedule('*/1 * * * *', runScanner);
+    log(`🚀 APEX v18.0 DEPLOYED ON PORT ${PORT}`);
+    runScanner(); 
+    cron.schedule('*/1 * * * *', runScanner); 
 });
