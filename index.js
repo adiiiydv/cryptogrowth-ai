@@ -20,8 +20,13 @@ let activeTrades = [];
 let lastKnownBal = 0;
 let isRunning = false;
 
+// ================= LOAD STATE =================
 if (fs.existsSync(STATE_FILE)) {
-    try { activeTrades = JSON.parse(fs.readFileSync(STATE_FILE)); } catch { activeTrades = []; }
+    try { 
+        activeTrades = JSON.parse(fs.readFileSync(STATE_FILE)); 
+    } catch (e) { 
+        activeTrades = []; 
+    }
 }
 
 const log = (m) => console.log(`[${new Date().toLocaleTimeString()}] ${m}`);
@@ -31,17 +36,35 @@ async function safeGet(url, timeout = 25000) {
     try {
         const res = await axios.get(url, { timeout });
         return res?.data || null;
-    } catch { return null; }
+    } catch (e) { 
+        return null; 
+    }
 }
 
-// ================= ORDER ENGINE =================
+// ================= FIXED ORDER ENGINE =================
 async function placeOrder(side, symbol, amount, qtyOverride = null) {
     try {
         const coin = symbol.replace("USDT", "");
-        const tickerData = await safeGet('https://public.coindcx.com/exchange/ticker');
-        const market = tickerData?.find(m => m.market.includes(coin) && m.market.includes("USDT"));
         
-        if (!market) return null;
+        // 1. Get Stable Ticker for Price Discovery
+        const tickerData = await safeGet('https://public.coindcx.com/exchange/ticker');
+        if (!tickerData) {
+            log(`❌ Ticker fetch failed - check internet connection`);
+            return null;
+        }
+
+        // 2. Smart Market Mapping (Handles B- prefix and standard USDT pairs)
+        const market = tickerData.find(m => 
+            m.market === `${coin}USDT` || 
+            m.market === `B-${coin}_USDT` || 
+            (m.market.includes(coin) && m.market.includes("USDT"))
+        );
+        
+        if (!market) {
+            log(`❌ Market mapping failed for ${coin}`);
+            return null;
+        }
+
         const price = parseFloat(market.last_price);
         const qty = qtyOverride ? Number(qtyOverride.toFixed(5)) : Number((amount / price).toFixed(5));
 
@@ -53,17 +76,27 @@ async function placeOrder(side, symbol, amount, qtyOverride = null) {
             timestamp: Date.now()
         };
 
+        // 3. Execute Order
         const res = await axios.post("https://api.coindcx.com/exchange/v1/orders/create", body, {
-            headers: { "X-AUTH-APIKEY": process.env.COINDCX_API_KEY, "X-AUTH-SIGNATURE": sign(body), "Content-Type": "application/json" },
+            headers: { 
+                "X-AUTH-APIKEY": process.env.COINDCX_API_KEY, 
+                "X-AUTH-SIGNATURE": sign(body), 
+                "Content-Type": "application/json" 
+            },
             timeout: 30000
         });
 
-        if (res.data?.status !== "error") {
-            log(`✅ ${side.toUpperCase()} SUCCESS: ${market.market}`);
+        if (res.data && res.data.status !== "error") {
+            log(`✅ ${side.toUpperCase()} SUCCESS: ${market.market} @ ${price}`);
             return { price, qty, market: market.market };
+        } else {
+            log(`❌ EXCH REJECT: ${res.data?.message || "Check Balance/Min Order"}`);
+            return null;
         }
-        return null;
-    } catch (e) { log(`❌ ORDER ERROR: ${e.message}`); return null; }
+    } catch (e) { 
+        log(`❌ API/NETWORK ERROR: ${e.message}`); 
+        return null; 
+    }
 }
 
 // ================= SCANNER WITH ANALYTICS =================
@@ -75,7 +108,10 @@ async function runScanner() {
         // 1. Refresh Balance
         const bBody = { timestamp: Date.now() };
         const bRes = await axios.post('https://api.coindcx.com/exchange/v1/users/balances', bBody, {
-            headers: { "X-AUTH-APIKEY": process.env.COINDCX_API_KEY, "X-AUTH-SIGNATURE": sign(bBody) },
+            headers: { 
+                "X-AUTH-APIKEY": process.env.COINDCX_API_KEY, 
+                "X-AUTH-SIGNATURE": sign(bBody) 
+            },
             timeout: 15000
         }).catch(() => null);
         
@@ -99,7 +135,10 @@ async function runScanner() {
 
             if (pnl <= -STOP_LOSS_PCT || pnl >= TAKE_PROFIT_PCT) {
                 const sold = await placeOrder("sell", t.symbol, 0, t.qty);
-                if (sold) { activeTrades.splice(i, 1); fs.writeFileSync(STATE_FILE, JSON.stringify(activeTrades)); }
+                if (sold) { 
+                    activeTrades.splice(i, 1); 
+                    fs.writeFileSync(STATE_FILE, JSON.stringify(activeTrades)); 
+                }
             }
         }
 
@@ -115,28 +154,36 @@ async function runScanner() {
             const ema9 = EMA.calculate({ values: closes, period: 9 }).pop();
             const ema21 = EMA.calculate({ values: closes, period: 21 }).pop();
 
-            // VISIBILITY: This prints the RSI/EMA for every coin to your terminal
             log(`📊 ${coin.padEnd(8)} | RSI: ${rsi.toFixed(2)} | EMA9: ${ema9.toFixed(2)} | EMA21: ${ema21.toFixed(2)}`);
 
             if (rsi < 60 && ema9 > ema21) {
                 log(`🎯 SIGNAL FOUND: Buying ${coin}...`);
                 const tradeAmt = lastKnownBal * ALLOCATION_PCT;
-                if (tradeAmt > 5) {
+                
+                // FIXED: Threshold lowered to $1 to accommodate your current balance
+                if (tradeAmt > 1) {
                     const buy = await placeOrder("buy", coin, tradeAmt);
                     if (buy) {
                         activeTrades.push({ symbol: coin, market: buy.market, entry: buy.price, qty: buy.qty });
                         fs.writeFileSync(STATE_FILE, JSON.stringify(activeTrades));
                     }
+                } else {
+                    log(`⚠️ Balance too low to trade (Trade Amount: $${tradeAmt.toFixed(2)})`);
                 }
             }
         }
-    } catch (e) { log(`❌ SCAN ERROR: ${e.message}`); }
-    finally { isRunning = false; }
+    } catch (e) { 
+        log(`❌ SCAN ERROR: ${e.message}`); 
+    } finally { 
+        isRunning = false; 
+    }
 }
 
-app.get('/', (_, res) => res.send("ANALYTICS BOT ACTIVE"));
+// ================= SERVER =================
+app.get('/', (_, res) => res.send("ANALYTICS BOT ACTIVE v16.4"));
+
 app.listen(PORT, '0.0.0.0', () => {
-    log(`🚀 v16.2 LIVE | LOGGING RSI/EMA DATA`);
+    log(`🚀 v16.4 LIVE | FULL ANALYTICS & SMART MAPPING ACTIVE`);
     runScanner();
     cron.schedule('*/1 * * * *', runScanner);
 });
