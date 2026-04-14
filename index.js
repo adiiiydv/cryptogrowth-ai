@@ -8,7 +8,7 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.get('/', (req, res) => res.send('Apex Pro v7: Native DCX Engine ⚫ Live'));
+app.get('/', (req, res) => res.send('Apex Pro v7.5: Native Ultra Engine ⚫ Live'));
 app.listen(PORT, () => console.log(`✅ System Live | Port ${PORT}`));
 
 // --- GLOBAL MEMORY & CONFIG ---
@@ -16,12 +16,11 @@ let WATCHLIST = ['DOGE', 'MATIC', 'ADA', 'XRP'];
 let activeTrades = [];
 let coinStats = {}; 
 let lastTradePerCoin = {}; 
-let higherTFCache = {};
-let lastHTFFetch = 0;
+let higherTFCache = {}; // Fixed cache structure
 let dailyKillSwitch = false;
 const MAX_TRADES = 3;
 
-let globalStats = { wins: 0, losses: 0, consecutiveLosses: 0, maxDrawdown: 0 };
+let globalStats = { wins: 0, losses: 0, consecutiveLosses: 0 };
 
 const signDCX = (body) => {
     const payload = Buffer.from(JSON.stringify(body)).toString();
@@ -33,42 +32,60 @@ const getPrecision = (symbol) => {
     return map[symbol] || 2; 
 };
 
-// --- DAILY RESET CRON (00:00 AM) ---
+// --- 1. NATIVE CANDLE FETCHER ---
+const getCandles = async (symbol, interval = "1m") => {
+    try {
+        const res = await axios.get(
+            `https://public.coindcx.com/market_data/candles?pair=${symbol}USDT&interval=${interval}`
+        );
+        return res.data.map(d => ({
+            open: parseFloat(d.open),
+            high: parseFloat(d.high),
+            low: parseFloat(d.low),
+            close: parseFloat(d.close),
+            volume: parseFloat(d.volume)
+        }));
+    } catch { return []; }
+};
+
+// --- 4 & 6. HIGHER TF CACHE & DAILY RESET ---
 cron.schedule('0 0 * * *', () => {
     dailyKillSwitch = false;
     globalStats.consecutiveLosses = 0;
-    console.log("🔄 Daily reset: Performance cleared for new session.");
+    console.log("🔄 Daily reset activated");
 });
 
-// --- CACHED 15M TREND CHECK ---
 const getHigherTrendCached = async (symbol) => {
     const now = Date.now();
-    if (!higherTFCache[symbol] || (now - lastHTFFetch > 60000)) {
+    // Cache check for 60 seconds
+    if (!higherTFCache[symbol] || now - higherTFCache[symbol].time > 60000) {
         try {
-            // Note: Using Binance here only for HTF trend as it's more stable for long candles
-            const res = await axios.get(`https://api.binance.com/api/v3/klines?symbol=${symbol}USDT&interval=15m&limit=20`);
-            const closes = res.data.map(d => parseFloat(d[4]));
+            const candles = await getCandles(symbol, "15m");
+            const closes = candles.map(c => c.close);
+            if (closes.length < 21) return false;
+
             const ema9 = EMA.calculate({ values: closes, period: 9 }).pop();
             const ema21 = EMA.calculate({ values: closes, period: 21 }).pop();
-            higherTFCache[symbol] = ema9 > ema21;
-            lastHTFFetch = now;
-        } catch { higherTFCache[symbol] = false; }
+
+            higherTFCache[symbol] = { isBull: ema9 > ema21, time: now };
+        } catch {
+            higherTFCache[symbol] = { isBull: false, time: now };
+        }
     }
-    return higherTFCache[symbol];
+    return higherTFCache[symbol].isBull;
 };
 
-// --- EXECUTION ENGINE ---
+// --- 8. EXECUTION SAFETY ---
 async function executeOrder(side, symbol, amount, exactQty = null) {
     try {
         if (side === "buy" && amount < 4 && !exactQty) {
-            console.log("❌ Amount too low for CoinDCX");
+            console.log("❌ Amount too low");
             return null;
         }
 
-        const tickerRes = await axios.get(`https://api.coindcx.com/exchange/v1/markets/ticker?pair=${symbol}USDT`).catch(() => null);
-        const safePrice = tickerRes?.data?.last_price ? parseFloat(tickerRes.data.last_price) : 0;
-        if (!safePrice) return null;
-
+        const tickerRes = await axios.get(`https://api.coindcx.com/exchange/v1/markets/ticker?pair=${symbol}USDT`);
+        const safePrice = parseFloat(tickerRes.data.last_price);
+        
         const precision = getPrecision(symbol);
         const qty = exactQty ? Number(exactQty.toFixed(precision)) : Number((amount / safePrice).toFixed(precision));
 
@@ -89,12 +106,12 @@ async function executeOrder(side, symbol, amount, exactQty = null) {
         console.log(`🚀 ${side.toUpperCase()} ${symbol} | QTY: ${qty} | PRICE: ${safePrice}`);
         return { price: safePrice, qty };
     } catch (e) {
-        console.log(`❌ ${symbol} ERR:`, e.response?.data?.message || e.message);
+        console.log(`❌ ${symbol} EXECUTION ERR:`, e.response?.data?.message || e.message);
         return null;
     }
 }
 
-// --- SCANNER (USING COINDCX DATA) ---
+// --- 2 & 3 & 5. SCANNER & ALLOCATION ---
 const runMultiScanner = async () => {
     if (dailyKillSwitch || globalStats.consecutiveLosses >= 3) return;
 
@@ -116,38 +133,36 @@ const runMultiScanner = async () => {
 
     for (const coin of WATCHLIST) {
         if (activeTrades.length >= MAX_TRADES || activeTrades.find(t => t.symbol === coin)) continue;
-        if (Date.now() - (lastTradePerCoin[coin] || 0) < 90000) continue; // 90s cooldown
+        if (Date.now() - (lastTradePerCoin[coin] || 0) < 90000) continue; // 90s Cooldown
 
         try {
-            // NATIVE COINDCX CANDLES
-            const res = await axios.get(`https://public.coindcx.com/market_data/candles?pair=${coin}USDT&interval=1m`);
-            const data = res.data.slice(0, 50); // Get recent 50
-            const closes = data.map(d => parseFloat(d.close));
-            const highs = data.map(d => parseFloat(d.high));
-            const lows = data.map(d => parseFloat(d.low));
+            const candles = await getCandles(coin, "1m");
+            const closes = candles.map(c => c.close);
+            const highs = candles.map(c => c.high);
+            const lows = candles.map(c => c.low);
 
             const isHighTrendBull = await getHigherTrendCached(coin);
-            
             const rsi = RSI.calculate({ values: closes, period: 14 }).pop();
             const ema9 = EMA.calculate({ values: closes, period: 9 }).pop();
             const ema21 = EMA.calculate({ values: closes, period: 21 }).pop();
             const currentAtr = ATR.calculate({ high: highs, low: lows, close: closes, period: 14 }).pop();
 
+            const momentum = closes[closes.length - 1] > closes[closes.length - 2];
+            const trendStrength = (ema9 - ema21) / ema21;
+
             let score = 0;
             if (rsi < 60) score++;
             if (ema9 > ema21) score++;
+            if (trendStrength > 0) score++;
+            if (momentum) score++; 
             if (isHighTrendBull) score += 2;
-            
-            // Momentum check
-            if (closes[closes.length - 1] > closes[closes.length - 2]) score++;
 
-            // 🎯 ACTIVITY TUNED: 3/5 if HighTrend is Bullish
-            if (score >= 3 && isHighTrendBull && balance > 4) {
+            if (score >= 4 && isHighTrendBull && balance > 4) {
                 const wr = coinStats[coin]?.winRate || 0.5;
-                // PROBLEM 3 FIX: Balanced Allocation
                 const tradeAmount = Math.min(
                     balance * (wr > 0.6 ? 0.35 : 0.25),
-                    balance / 2
+                    balance / 2,
+                    balance - 0.1
                 ).toFixed(2);
 
                 const bought = await executeOrder("buy", coin, tradeAmount);
@@ -157,7 +172,6 @@ const runMultiScanner = async () => {
                         entry: bought.price, 
                         qty: bought.qty, 
                         highestPrice: bought.price,
-                        // ATR Stop Safety Fix
                         atrStop: Math.min(currentAtr * 1.5, bought.price * 0.01)
                     });
                     lastTradePerCoin[coin] = Date.now();
@@ -167,7 +181,7 @@ const runMultiScanner = async () => {
     }
 };
 
-// --- EXIT ENGINE ---
+// --- 7. EXIT ENGINE ---
 async function checkTrailingExit(trade, index) {
     try {
         const ticker = await axios.get(`https://api.coindcx.com/exchange/v1/markets/ticker?pair=${trade.symbol}USDT`);
@@ -181,13 +195,11 @@ async function checkTrailingExit(trade, index) {
         const atrPercent = (trade.atrStop / trade.entry) * 100;
 
         if ((gain > 0.7 && drop > dynamicTrail) || gain < -atrPercent) {
-            console.log(`🚪 EXITING ${trade.symbol} | Gain: ${gain.toFixed(2)}%`);
+            console.log(`🚪 EXIT ${trade.symbol} | Gain: ${gain.toFixed(2)}% | Stop: ${atrPercent.toFixed(2)}%`);
             
             if (gain > 0.15) {
-                globalStats.wins++;
                 globalStats.consecutiveLosses = 0;
             } else {
-                globalStats.losses++;
                 globalStats.consecutiveLosses++;
             }
 
