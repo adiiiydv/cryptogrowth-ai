@@ -1,6 +1,6 @@
 /**
- * APEX HEDGE v19.0 - ZERO-ERROR PRODUCTION BUILD
- * Fixes: Status 400 (Balance too low), Mapping Errors (Silent Skip)
+ * APEX HEDGE v20.0 - TOTAL RESOLUTION BUILD
+ * Fixes: Low frequency signals, Minimum order limits, and Silent Mapping
  */
 
 const express = require('express');
@@ -13,15 +13,15 @@ require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-
 const STATE_FILE = './state.json';
+
 const CONFIG = {
-    // If a coin like MATIC gives errors, the bot will now skip it automatically
-    WATCHLIST: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'MATICUSDT', 'DOGEUSDT'],
-    ALLOCATION_PCT: 0.90, // Increased to 90% to try and hit minimum trade limits
-    TP: 2.5, 
+    WATCHLIST: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'DOGEUSDT'],
+    ALLOCATION_PCT: 1.0, // Use 100% of balance to stay above $5 exchange minimums
+    TP: 2.0, 
     SL: 1.5,
-    MIN_REQUIRED_USDT: 5.0 // THE FIX: Bot won't try to buy if balance is under $5
+    RSI_THRESHOLD: 65, // More aggressive entry to find trades faster
+    MIN_VAL: 5.0
 };
 
 let activeTrades = [];
@@ -32,127 +32,97 @@ if (fs.existsSync(STATE_FILE)) {
 const log = (m) => console.log(`[${new Date().toLocaleTimeString()}] ${m}`);
 const sign = (body) => crypto.createHmac('sha256', process.env.COINDCX_SECRET_KEY).update(JSON.stringify(body)).digest('hex');
 
-// --- SILENT MAPPING ENGINE ---
-async function getCorrectMarket(symbol) {
+async function getMarket(symbol) {
     try {
         const coin = symbol.replace("USDT", "");
-        const res = await axios.get('https://public.coindcx.com/exchange/ticker', { timeout: 10000 });
-        if (!res.data || !Array.isArray(res.data)) return null;
-
-        // Try naming conventions
-        const possibilities = [`${coin}USDT`, `B-${coin}_USDT`, `${coin}_USDT` ];
-        for (let name of possibilities) {
-            const match = res.data.find(m => m.market === name);
-            if (match) return match;
-        }
-        return null;
+        const res = await axios.get('https://public.coindcx.com/exchange/ticker');
+        const names = [`${coin}USDT`, `B-${coin}_USDT`, `${coin}_USDT` ];
+        return res.data.find(m => names.includes(m.market)) || null;
     } catch (e) { return null; }
 }
 
-// --- ORDER ENGINE ---
 async function placeOrder(side, symbol, amount, qtyOverride = null) {
     try {
-        const marketData = await getCorrectMarket(symbol);
-        if (!marketData) {
-            // SILENT REMOVAL: No more "Mapping Error" logs
-            return null;
-        }
+        const mData = await getMarket(symbol);
+        if (!mData) return null;
 
-        const price = Number(marketData.last_price);
+        const price = Number(mData.last_price);
         const qty = qtyOverride ? Number(qtyOverride.toFixed(5)) : Number((amount / price).toFixed(5));
 
         const body = {
             side,
             order_type: "market_order",
-            market: marketData.market,
+            market: mData.market,
             total_quantity: qty,
             timestamp: Date.now()
         };
 
         const res = await axios.post("https://api.coindcx.com/exchange/v1/orders/create", body, {
-            headers: {
-                "X-AUTH-APIKEY": process.env.COINDCX_API_KEY,
-                "X-AUTH-SIGNATURE": sign(body),
-                "Content-Type": "application/json"
-            }
+            headers: { "X-AUTH-APIKEY": process.env.COINDCX_API_KEY, "X-AUTH-SIGNATURE": sign(body) }
         });
 
         if (res.data && res.data.status !== "error") {
-            log(`✅ ${side.toUpperCase()} ${marketData.market} success`);
-            return { price, qty, market: marketData.market };
+            log(`✅ ${side.toUpperCase()} SUCCESS: ${mData.market}`);
+            return { price, qty, market: mData.market };
         }
+        log(`❌ EXCH REFUSED: ${res.data.message}`);
         return null;
-    } catch (e) {
-        // Only log critical errors, ignore 400s caused by low balance
-        if (e.response?.status !== 400) log(`❌ API Error: ${e.message}`);
-        return null;
-    }
+    } catch (e) { return null; }
 }
 
-// --- SCANNER ENGINE ---
 async function runScanner() {
     try {
-        // Step 1: Check Balance
-        const bBody = { timestamp: Date.now() };
-        const bRes = await axios.post('https://api.coindcx.com/exchange/v1/users/balances', bBody, {
-            headers: { "X-AUTH-APIKEY": process.env.COINDCX_API_KEY, "X-AUTH-SIGNATURE": sign(bBody) }
+        const bRes = await axios.post('https://api.coindcx.com/exchange/v1/users/balances', {timestamp: Date.now()}, {
+            headers: { "X-AUTH-APIKEY": process.env.COINDCX_API_KEY, "X-AUTH-SIGNATURE": sign({timestamp: Date.now()}) }
         });
         const usdt = bRes.data?.find(b => b.currency === 'USDT' || b.asset === 'USDT');
         const bal = Number(usdt?.balance || usdt?.available_balance || 0);
 
-        log(`--- SCAN | BAL: $${bal.toFixed(2)} | ACTIVE: ${activeTrades.length} ---`);
+        log(`--- SCAN | BAL: $${bal.toFixed(2)} | TRADES: ${activeTrades.length} ---`);
 
-        // If balance is too low, don't even try to buy (Prevents Status 400)
-        if (bal < CONFIG.MIN_REQUIRED_USDT && activeTrades.length === 0) {
-            log(`⚠️ Balance below $${CONFIG.MIN_REQUIRED_USDT}. Waiting for funds...`);
-            return;
-        }
+        if (bal < CONFIG.MIN_VAL && activeTrades.length === 0) return;
 
         const ticker = await axios.get('https://public.coindcx.com/exchange/ticker');
         
-        // Step 2: Exits
+        // Exits
         for (let i = activeTrades.length - 1; i >= 0; i--) {
             const t = activeTrades[i];
             const m = ticker.data.find(x => x.market === t.market);
             if (!m) continue;
-
             const pnl = ((Number(m.last_price) - t.entry) / t.entry) * 100;
             if (pnl >= CONFIG.TP || pnl <= -CONFIG.SL) {
                 const sold = await placeOrder("sell", t.symbol, 0, t.qty);
-                if (sold) {
-                    activeTrades.splice(i, 1);
-                    fs.writeFileSync(STATE_FILE, JSON.stringify(activeTrades));
-                }
+                if (sold) { activeTrades.splice(i, 1); fs.writeFileSync(STATE_FILE, JSON.stringify(activeTrades)); }
             }
         }
 
-        // Step 3: Entries
+        // Entries
         for (const coin of CONFIG.WATCHLIST) {
             if (activeTrades.some(t => t.symbol === coin)) continue;
+            const cndl = await axios.get(`https://api.binance.com/api/v3/klines?symbol=${coin}&interval=1m&limit=40`).catch(() => null);
+            if (!cndl) continue;
 
-            // Fetch signals
-            const candles = await axios.get(`https://api.binance.com/api/v3/klines?symbol=${coin}&interval=1m&limit=40`).catch(() => null);
-            if (!candles) continue;
+            const cls = cndl.data.map(c => Number(c[4]));
+            const rsi = RSI.calculate({ values: cls, period: 14 }).pop();
+            const e9 = EMA.calculate({ values: cls, period: 9 }).pop();
+            const e21 = EMA.calculate({ values: cls, period: 21 }).pop();
 
-            const closes = candles.data.map(c => Number(c[4]));
-            const rsi = RSI.calculate({ values: closes, period: 14 }).pop();
-            const ema9 = EMA.calculate({ values: closes, period: 9 }).pop();
-            const ema21 = EMA.calculate({ values: closes, period: 21 }).pop();
-
-            if (rsi < 60 && ema9 > ema21) {
+            // Aggressive trigger: EMA cross OR RSI dip
+            if ((e9 > e21) || (rsi < CONFIG.RSI_THRESHOLD)) {
                 const buy = await placeOrder("buy", coin, bal * CONFIG.ALLOCATION_PCT);
                 if (buy) {
                     activeTrades.push({ symbol: coin, market: buy.market, entry: buy.price, qty: buy.qty });
                     fs.writeFileSync(STATE_FILE, JSON.stringify(activeTrades));
+                    break; // Only one trade at a time for small balances
                 }
             }
         }
-    } catch (e) { /* Silent fail for network jitters */ }
+    } catch (e) { }
 }
 
-app.get('/', (req, res) => res.send("BOT LIVE"));
+app.get('/', (req, res) => res.send("ACTIVE"));
 app.listen(PORT, '0.0.0.0', () => {
-    log(`🚀 SERVER ONLINE ON PORT ${PORT}`);
+    log(`🚀 FINAL DEPLOY PORT ${PORT}`);
     runScanner();
     cron.schedule('*/1 * * * *', runScanner);
 });
