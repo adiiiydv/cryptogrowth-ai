@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Apex Pro Dashboard</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body { background: #0f172a; color: white; font-family: sans-serif; text-align: center; padding: 20px; }
+    .card { background: #1e293b; max-width: 900px; margin: auto; padding: 20px; border-radius: 15px; box-shadow: 0 4px 20px rgba(0,0,0,0.4); }
+    canvas { background: #1e293b; margin: 20px 0; border-radius: 10px; }
+    select { padding: 10px 20px; border-radius: 5px; background: #334155; color: white; border: 1px solid #475569; font-size: 1rem; }
+    h2 { color: #38bdf8; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>📊 Apex Pro Live Monitoring</h2>
+    <select id="coinSelect">
+      <option>BTC</option><option>ETH</option><option>SOL</option>
+      <option>BNB</option><option>DOGE</option><option>MATIC</option>
+      <option>ADA</option><option>XRP</option>
+    </select>
+    <canvas id="priceChart"></canvas>
+    <canvas id="rsiChart"></canvas>
+  </div>
+
+  <script>
+    let priceChart, rsiChart;
+    async function loadData() {
+        const coin = document.getElementById("coinSelect").value;
+        const res = await fetch(`/indicators/${coin}`);
+        const data = await res.json();
+        if(!data.closes) return;
+        const labels = data.closes.map((_, i) => i);
+
+        if (priceChart) priceChart.destroy();
+        if (rsiChart) rsiChart.destroy();
+
+        priceChart = new Chart(document.getElementById("priceChart"), {
+            type: 'line',
+            data: {
+                labels,
+                datasets: [
+                    { label: 'Price', data: data.closes, borderColor: '#38bdf8', tension: 0.1 },
+                    { label: 'EMA 9', data: data.ema9, borderColor: '#fbbf24', borderDash: [5,5] },
+                    { label: 'EMA 21', data: data.ema21, borderColor: '#f87171' }
+                ]
+            },
+            options: { plugins: { legend: { labels: { color: 'white' } } } }
+        });
+
+        rsiChart = new Chart(document.getElementById("rsiChart"), {
+            type: 'line',
+            data: {
+                labels,
+                datasets: [{ label: 'RSI', data: data.rsi, borderColor: '#4ade80', fill: true, backgroundColor: 'rgba(74,222,128,0.1)' }]
+            },
+            options: { plugins: { legend: { labels: { color: 'white' } } } }
+        });
+    }
+    setInterval(loadData, 10000);
+    loadData();
+    document.getElementById("coinSelect").addEventListener("change", loadData);
+  </script>
+</body>
+</html>
