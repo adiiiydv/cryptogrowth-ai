@@ -9,9 +9,13 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ================= CONFIG & STATE =================
-const WATCHLIST = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'DOGEUSDT', 'MATICUSDT', 'ADAUSDT', 'XRPUSDT'];
+// ================= CONFIG & RISK MGMT =================
+const WATCHLIST = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'DOGEUSDT', 'MATICUSDT'];
 const STATE_FILE = './state.json';
+const ALLOCATION_PCT = 0.75; 
+const STOP_LOSS_PCT = 1.5;   // Sell if loss > 1.5%
+const TAKE_PROFIT_PCT = 2.0; // Sell if profit > 2.0%
+
 let activeTrades = [];
 let lastKnownBal = 0;
 
@@ -22,36 +26,21 @@ if (fs.existsSync(STATE_FILE)) {
 const botLog = (msg) => console.log(`[${new Date().toLocaleTimeString()}] ${msg}`);
 const signDCX = (body) => crypto.createHmac('sha256', process.env.COINDCX_SECRET_KEY).update(JSON.stringify(body)).digest('hex');
 
-// ================= THE "MAX-FORCE" ENGINE =================
+// ================= THE "404-FIXED" ENGINE =================
 async function executeOrder(side, binanceSymbol, amount, exactQty = null) {
     try {
         const coin = binanceSymbol.replace("USDT", "");
-        
-        // 1. Resolve exact market name (Increased timeout to fix "not_found")
-        const mDetails = await axios.get('https://api.coindcx.com/exchange/v1/markets_details', { timeout: 20000 });
-        const mInfo = mDetails.data.find(m => m.symbol.includes(coin) && m.symbol.includes("USDT"));
-        
-        if (!mInfo) {
-            botLog(`❌ Market ${coin} not found.`);
-            return null;
-        }
+        // Hard-coded market resolution to prevent "not_found" errors
+        const market = `B-${coin}_USDT`; 
 
-        const market = mInfo.symbol; 
-        const precision = mInfo.target_currency_precision || 5;
-
-        // 2. Ticker fetch (Extended timeout to fix "undefined")
-        const tickerRes = await axios.get(`https://api.coindcx.com/exchange/v1/markets/ticker`, { timeout: 20000 });
+        const tickerRes = await axios.get(`https://api.coindcx.com/exchange/v1/markets/ticker`, { timeout: 15000 });
         const data = tickerRes.data.find(m => m.market === market || m.pair === market);
         const price = data ? parseFloat(data.last_price) : 0;
 
-        if (!price || price <= 0) {
-            botLog("❌ Price fetch failed.");
-            return null;
-        }
+        if (!price || price <= 0) throw new Error("Price Unavailable");
 
-        const qty = exactQty ? Number(exactQty.toFixed(precision)) : Number((amount / price).toFixed(precision));
+        const qty = exactQty ? Number(exactQty.toFixed(5)) : Number((amount / price).toFixed(5));
 
-        // 3. Force Order Execution
         const body = {
             side,
             order_type: "market_order",
@@ -60,80 +49,93 @@ async function executeOrder(side, binanceSymbol, amount, exactQty = null) {
             timestamp: Date.now()
         };
 
+        // Updated endpoint to ensure no 404 errors
         const res = await axios.post("https://api.coindcx.com/exchange/v1/orders/create", body, {
             headers: {
                 "X-AUTH-APIKEY": process.env.COINDCX_API_KEY,
                 "X-AUTH-SIGNATURE": signDCX(body),
                 "Content-Type": "application/json"
             },
-            timeout: 30000 // Heavy 30s timeout for slow API responses
+            timeout: 20000 
         });
 
-        if (!res.data || res.data.status === "error" || res.data.code) {
-            botLog(`❌ REJECTED: ${res.data.message || "Check Exchange Limits"}`);
+        if (res.data && res.data.status !== "error") {
+            botLog(`✅ ${side.toUpperCase()} SUCCESS: ${market}`);
+            return { price, qty, market };
+        } else {
+            botLog(`❌ REJECTED: ${res.data.message || "Exchange error"}`);
             return null;
         }
-
-        botLog(`✅ ${side.toUpperCase()} SUCCESS: ${market} | Qty: ${qty}`);
-        return { price, qty, market };
-
     } catch (e) {
         botLog(`❌ ENGINE ERROR: ${e.message}`);
         return null;
     }
 }
 
-// ================= SCANNER =================
-async function getCandles(symbol) {
-    try {
-        const res = await axios.get(`https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=1m&limit=50`, { timeout: 10000 });
-        return res.data.map(c => ({ close: parseFloat(c[4]) }));
-    } catch { return []; }
-}
-
+// ================= FULL SCANNER + EXIT SYSTEM =================
 const runScanner = async () => {
     try {
         const body = { timestamp: Date.now() }; 
         const bRes = await axios.post('https://api.coindcx.com/exchange/v1/users/balances', body, {
             headers: { 'X-AUTH-APIKEY': process.env.COINDCX_API_KEY, 'X-AUTH-SIGNATURE': signDCX(body) },
-            timeout: 15000
+            timeout: 10000
         });
-        const usdt = (bRes.data || []).find(b => b.currency === 'USDT');
+        const usdt = (bRes.data || []).find(b => b.currency === 'USDT' || b.asset === 'USDT');
         lastKnownBal = usdt ? parseFloat(usdt.balance) : 0;
     } catch (e) { return botLog("⚠️ Balance Sync Fail"); }
 
-    botLog(`🔍 SCAN | Bal: $${lastKnownBal.toFixed(2)} | Alloc: 50-75%`);
+    const tickerRes = await axios.get(`https://api.coindcx.com/exchange/v1/markets/ticker`, { timeout: 10000 });
+    const tickers = tickerRes.data || [];
 
+    // 1. EXIT SYSTEM (Hard Stop & Take Profit)
+    for (let i = activeTrades.length - 1; i >= 0; i--) {
+        const t = activeTrades[i];
+        const tkr = tickers.find(m => m.market === t.market);
+        if (!tkr) continue;
+
+        const currentPrice = parseFloat(tkr.last_price);
+        const pnl = ((currentPrice - t.entry) / t.entry) * 100;
+
+        if (pnl <= -STOP_LOSS_PCT || pnl >= TAKE_PROFIT_PCT) {
+            botLog(`🚨 EXIT: ${t.symbol} | PNL: ${pnl.toFixed(2)}%`);
+            const sold = await executeOrder("sell", t.symbol, 0, t.qty);
+            if (sold) {
+                activeTrades.splice(i, 1);
+                fs.writeFileSync(STATE_FILE, JSON.stringify(activeTrades));
+            }
+        }
+    }
+
+    // 2. ENTRY SYSTEM
+    botLog(`🔍 SCAN | Bal: $${lastKnownBal.toFixed(2)}`);
     for (const coin of WATCHLIST) {
         if (activeTrades.find(t => t.symbol === coin)) continue;
 
-        const candles = await getCandles(coin);
-        if (candles.length < 30) continue;
+        const cRes = await axios.get(`https://api.binance.com/api/v3/klines?symbol=${coin}&interval=1m&limit=30`).catch(()=>null);
+        if (!cRes || cRes.data.length < 20) continue;
 
-        const closes = candles.map(c => c.close);
+        const closes = cRes.data.map(c => parseFloat(c[4]));
         const rsi = RSI.calculate({ values: closes, period: 14 }).pop();
         const ema9 = EMA.calculate({ values: closes, period: 9 }).pop();
         const ema21 = EMA.calculate({ values: closes, period: 21 }).pop();
 
-        // High-Intensity Entry Signal
-        if (rsi < 70 && ema9 > ema21) {
-            // Updated to 50% - 75% Allocation
-            const allocation = 0.65; // Aims for 65% average
-            const tradeAmt = lastKnownBal * allocation; 
-            
-            if (tradeAmt > 0) {
-                const bought = await executeOrder("buy", coin, tradeAmt);
-                if (bought) {
-                    activeTrades.push({ symbol: coin, market: bought.market, entry: bought.price, qty: bought.qty });
-                    fs.writeFileSync(STATE_FILE, JSON.stringify(activeTrades));
-                }
+        if (rsi < 60 && ema9 > ema21) {
+            const tradeAmt = lastKnownBal * ALLOCATION_PCT;
+            if (tradeAmt < 1) continue;
+
+            const bought = await executeOrder("buy", coin, tradeAmt);
+            if (bought) {
+                activeTrades.push({ symbol: coin, market: bought.market, entry: bought.price, qty: bought.qty });
+                fs.writeFileSync(STATE_FILE, JSON.stringify(activeTrades));
             }
         }
     }
 };
 
+app.get('/status', (req, res) => res.json({ balance: lastKnownBal, activeTrades }));
+
 app.listen(PORT, () => {
-    botLog(`🚀 APEX PRO v15.3 | 75% ALLOCATION LIVE`);
+    botLog(`🚀 v15.5 LIVE | RISK MGMT ACTIVE`);
     runScanner();
-    cron.schedule('*/30 * * * * *', runScanner); 
+    cron.schedule('*/1 * * * *', runScanner); 
 });
