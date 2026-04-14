@@ -24,7 +24,7 @@ let lossStreak = 0;
 
 const botLog = (msg) => console.log(`[${new Date().toLocaleTimeString()}] ${msg}`);
 
-// Persistence
+// --- PERSISTENCE LAYER ---
 if (fs.existsSync(STATE_FILE)) {
     try { activeTrades = JSON.parse(fs.readFileSync(STATE_FILE)); } catch (e) { activeTrades = []; }
 }
@@ -43,27 +43,32 @@ const getCandles = async (symbol) => {
     } catch (e) { return []; }
 };
 
-// --- CORE: SMART EXECUTION ENGINE ---
+// --- CORE: SMART RESOLVER EXECUTION ENGINE ---
 async function executeOrder(side, binanceSymbol, amount, exactQty = null) {
     try {
-        // Step 1: Resolve exact market ID and precision
-        const marketsRes = await axios.get('https://api.coindcx.com/exchange/v1/markets_details');
+        // 1. Resolve exact market ID and precision via Market Details
+        const mDetails = await axios.get('https://api.coindcx.com/exchange/v1/markets_details', { timeout: 5000 });
+        if (!mDetails.data) throw new Error("Market details data undefined");
+
         const coin = binanceSymbol.replace('USDT', '');
         const possibleIds = [binanceSymbol, `B-${coin}_USDT`, `${coin}_USDT` ];
         
-        const mInfo = marketsRes.data.find(m => possibleIds.includes(m.symbol) || possibleIds.includes(m.coindcx_name));
-        if (!mInfo) throw new Error(`Market not found for ${binanceSymbol}`);
+        const mInfo = mDetails.data.find(m => possibleIds.includes(m.symbol) || possibleIds.includes(m.coindcx_name));
+        if (!mInfo) throw new Error(`Market mapping failed for ${binanceSymbol}`);
 
         const marketId = mInfo.symbol;
-        const prec = mInfo.target_currency_precision || 5;
+        const precision = mInfo.target_currency_precision || 5;
 
-        // Step 2: Get Live Price
-        const tickerRes = await axios.get(`https://api.coindcx.com/exchange/v1/markets/ticker`);
+        // 2. Fetch Live Price from Ticker
+        const tickerRes = await axios.get(`https://api.coindcx.com/exchange/v1/markets/ticker`, { timeout: 5000 });
+        if (!tickerRes.data) throw new Error("Ticker response data undefined");
+
         const ticker = tickerRes.data.find(t => t.market === marketId);
+        if (!ticker) throw new Error(`Ticker not found for ${marketId}`);
         const price = parseFloat(ticker.last_price);
 
-        // Step 3: Calculate Quantity
-        const qty = exactQty ? Number(exactQty.toFixed(prec)) : Number((amount / price).toFixed(prec));
+        // 3. Precision-Correct Quantity Calculation
+        const qty = exactQty ? Number(exactQty.toFixed(precision)) : Number((amount / price).toFixed(precision));
         if (qty <= 0) return null;
 
         const body = { 
@@ -74,18 +79,23 @@ async function executeOrder(side, binanceSymbol, amount, exactQty = null) {
             timestamp: Date.now() 
         };
 
+        // 4. Authorized API Request
         const res = await axios.post('https://api.coindcx.com/exchange/v1/orders/create', body, {
-            headers: { 'X-AUTH-APIKEY': process.env.COINDCX_API_KEY, 'X-AUTH-SIGNATURE': signDCX(body) }
+            headers: { 
+                'X-AUTH-APIKEY': process.env.COINDCX_API_KEY, 
+                'X-AUTH-SIGNATURE': signDCX(body),
+                'Content-Type': 'application/json'
+            }
         });
 
         return { price, qty, marketId };
     } catch (e) {
-        botLog(`❌ ${side.toUpperCase()} FAIL | ${binanceSymbol}: ${e.response?.data?.message || e.message}`);
+        botLog(`❌ ${side.toUpperCase()} ERROR | ${binanceSymbol}: ${e.response?.data?.message || e.message}`);
         return null;
     }
 }
 
-// --- EXIT STRATEGY (CHECKER) ---
+// --- RISK & EXIT MANAGEMENT ---
 async function checkExits(t, idx, tickerList) {
     try {
         const coin = t.symbol.replace('USDT', '');
@@ -100,7 +110,7 @@ async function checkExits(t, idx, tickerList) {
         const dropFromHigh = ((t.highest - p) / t.highest) * 100;
         const stopLossVal = (t.stop / t.entry) * 100;
 
-        // 🟢 Take Profit: 1.2% gain + 0.3% pullback | 🔴 Stop Loss: ATR based
+        // Exit Logic: Trailing Take Profit or Dynamic Stop Loss
         if ((gain > (1.2 + FEES) && dropFromHigh > 0.3) || gain < -stopLossVal) {
             const sold = await executeOrder("sell", t.symbol, 0, t.qty);
             if (sold) {
@@ -110,15 +120,16 @@ async function checkExits(t, idx, tickerList) {
                 botLog(`💰 EXIT ${t.symbol} | PnL: ${gain.toFixed(2)}% | Streak: ${lossStreak}`);
             }
         }
-    } catch (e) { botLog(`⚠️ Exit Error: ${e.message}`); }
+    } catch (e) { botLog(`⚠️ Exit Check Err: ${e.message}`); }
 }
 
-// --- SCANNER LOOP ---
+// --- MAIN SCANNER LOOP ---
 const runScanner = async () => {
+    // Reset Hourly Quota
     if (new Date().getHours() !== lastHour) { tradesThisHour = 0; lastHour = new Date().getHours(); }
-    if (lossStreak >= 5) return botLog("🛑 HALTED: Max Loss Streak reached.");
+    if (lossStreak >= 5) return botLog("🛑 BOT HALTED: Maximum loss streak reached.");
 
-    // Update Balance
+    // Step 1: Sync Balance
     try {
         const body = { timestamp: Date.now() }; 
         const bRes = await axios.post('https://api.coindcx.com/exchange/v1/users/balances', body, {
@@ -126,19 +137,20 @@ const runScanner = async () => {
         });
         const usdt = (bRes.data || []).find(b => b.currency === 'USDT' || b.asset === 'USDT');
         lastKnownBal = usdt ? parseFloat(usdt.balance) - parseFloat(usdt.locked_balance || 0) : 0;
-    } catch (e) { return botLog("⚠️ Bal API Err"); }
+    } catch (e) { return botLog("⚠️ Balance Sync Failed"); }
 
+    // Step 2: Global Ticker Sync for Exits
     const tickerRes = await axios.get(`https://api.coindcx.com/exchange/v1/markets/ticker`);
-    const allTickers = tickerRes.data;
+    const allTickers = tickerRes.data || [];
 
-    botLog(`🔍 SCAN | Bal: $${lastKnownBal.toFixed(2)} | Quota: ${tradesThisHour}/${TARGET_TRADES_PER_HOUR}`);
+    botLog(`🔍 SCAN | Bal: $${lastKnownBal.toFixed(2)} | Streak: ${lossStreak}`);
 
-    // Check Exits first
+    // Step 3: Check Exits
     for (let i = activeTrades.length - 1; i >= 0; i--) {
         await checkExits(activeTrades[i], i, allTickers);
     }
 
-    // Scan for entries
+    // Step 4: Scan Watchlist for Entries
     for (const coin of WATCHLIST) {
         if (activeTrades.find(t => t.symbol === coin)) continue;
         if (Date.now() - (lastTradePerCoin[coin] || 0) < 60000) continue;
@@ -174,12 +186,12 @@ const runScanner = async () => {
     }
 };
 
-// --- APP SETUP ---
+// --- API ROUTES & SERVER ---
 app.get('/status', (req, res) => res.json({ balance: lastKnownBal, trades: activeTrades, lossStreak }));
-app.get('/', (req, res) => res.send("Apex Pro v12.6 is Live."));
+app.get('/', (req, res) => res.send("Apex Pro v12.7 is running safely."));
 
 app.listen(PORT, '0.0.0.0', () => {
-    botLog(`✅ APEX PRO v12.6 ULTIMATE | PORT ${PORT}`);
-    runScanner();
-    cron.schedule('*/30 * * * * *', runScanner);
+    botLog(`✅ APEX PRO v12.7 DEPLOYED | PORT ${PORT}`);
+    runScanner(); // Initial Run
+    cron.schedule('*/30 * * * * *', runScanner); // Scan every 30 seconds
 });
