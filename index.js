@@ -1,6 +1,6 @@
 /**
- * APEX HEDGE v20.0 - TOTAL RESOLUTION BUILD
- * Fixes: Low frequency signals, Minimum order limits, and Silent Mapping
+ * APEX HEDGE v21.0 - STABLE PRODUCTION
+ * Focus: High Visibility Logs & Improved Entry Logic
  */
 
 const express = require('express');
@@ -17,10 +17,9 @@ const STATE_FILE = './state.json';
 
 const CONFIG = {
     WATCHLIST: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'DOGEUSDT'],
-    ALLOCATION_PCT: 1.0, // Use 100% of balance to stay above $5 exchange minimums
+    ALLOCATION_PCT: 1.0, 
     TP: 2.0, 
     SL: 1.5,
-    RSI_THRESHOLD: 65, // More aggressive entry to find trades faster
     MIN_VAL: 5.0
 };
 
@@ -62,12 +61,15 @@ async function placeOrder(side, symbol, amount, qtyOverride = null) {
         });
 
         if (res.data && res.data.status !== "error") {
-            log(`✅ ${side.toUpperCase()} SUCCESS: ${mData.market}`);
+            log(`✅ ${side.toUpperCase()} EXECUTED: ${mData.market} @ ${price}`);
             return { price, qty, market: mData.market };
         }
-        log(`❌ EXCH REFUSED: ${res.data.message}`);
+        log(`❌ EXCH REFUSED: ${res.data.message || "Unknown Error"}`);
         return null;
-    } catch (e) { return null; }
+    } catch (e) { 
+        log(`❌ ORDER FAILED: ${e.message}`);
+        return null; 
+    }
 }
 
 async function runScanner() {
@@ -78,28 +80,39 @@ async function runScanner() {
         const usdt = bRes.data?.find(b => b.currency === 'USDT' || b.asset === 'USDT');
         const bal = Number(usdt?.balance || usdt?.available_balance || 0);
 
-        log(`--- SCAN | BAL: $${bal.toFixed(2)} | TRADES: ${activeTrades.length} ---`);
+        log(`--- HEARTBEAT | BAL: $${bal.toFixed(2)} | ACTIVE TRADES: ${activeTrades.length} ---`);
 
-        if (bal < CONFIG.MIN_VAL && activeTrades.length === 0) return;
+        if (bal < CONFIG.MIN_VAL && activeTrades.length === 0) {
+            log(`⚠️ Waiting for balance to stay above $5.00`);
+            return;
+        }
 
         const ticker = await axios.get('https://public.coindcx.com/exchange/ticker');
         
-        // Exits
+        // EXIT CHECK
         for (let i = activeTrades.length - 1; i >= 0; i--) {
             const t = activeTrades[i];
             const m = ticker.data.find(x => x.market === t.market);
             if (!m) continue;
-            const pnl = ((Number(m.last_price) - t.entry) / t.entry) * 100;
+            const currentPrice = Number(m.last_price);
+            const pnl = ((currentPrice - t.entry) / t.entry) * 100;
+            log(`📊 POSITION: ${t.symbol} | PNL: ${pnl.toFixed(2)}% | Price: ${currentPrice}`);
+
             if (pnl >= CONFIG.TP || pnl <= -CONFIG.SL) {
+                log(`🚨 EXIT SIGNAL for ${t.symbol}`);
                 const sold = await placeOrder("sell", t.symbol, 0, t.qty);
-                if (sold) { activeTrades.splice(i, 1); fs.writeFileSync(STATE_FILE, JSON.stringify(activeTrades)); }
+                if (sold) { 
+                    activeTrades.splice(i, 1); 
+                    fs.writeFileSync(STATE_FILE, JSON.stringify(activeTrades)); 
+                }
             }
         }
 
-        // Entries
+        // ENTRY SCAN
         for (const coin of CONFIG.WATCHLIST) {
             if (activeTrades.some(t => t.symbol === coin)) continue;
-            const cndl = await axios.get(`https://api.binance.com/api/v3/klines?symbol=${coin}&interval=1m&limit=40`).catch(() => null);
+            
+            const cndl = await axios.get(`https://api.binance.com/api/v3/klines?symbol=${coin}&interval=1m&limit=50`).catch(() => null);
             if (!cndl) continue;
 
             const cls = cndl.data.map(c => Number(c[4]));
@@ -107,22 +120,28 @@ async function runScanner() {
             const e9 = EMA.calculate({ values: cls, period: 9 }).pop();
             const e21 = EMA.calculate({ values: cls, period: 21 }).pop();
 
-            // Aggressive trigger: EMA cross OR RSI dip
-            if ((e9 > e21) || (rsi < CONFIG.RSI_THRESHOLD)) {
+            // VISIBILITY: Log the indicators so you can see them moving
+            log(`🔍 SCAN: ${coin.padEnd(8)} | RSI: ${rsi.toFixed(2)} | EMA9: ${e9.toFixed(2)} | EMA21: ${e21.toFixed(2)}`);
+
+            // ENTRY LOGIC: Buy when RSI is oversold (< 45) OR EMA cross occurs
+            if (rsi < 45 || e9 > e21) {
+                log(`🎯 SIGNAL FOUND: Buying ${coin}`);
                 const buy = await placeOrder("buy", coin, bal * CONFIG.ALLOCATION_PCT);
                 if (buy) {
                     activeTrades.push({ symbol: coin, market: buy.market, entry: buy.price, qty: buy.qty });
                     fs.writeFileSync(STATE_FILE, JSON.stringify(activeTrades));
-                    break; // Only one trade at a time for small balances
+                    break; 
                 }
             }
         }
-    } catch (e) { }
+    } catch (e) {
+        log(`❌ SCANNER ERROR: ${e.message}`);
+    }
 }
 
-app.get('/', (req, res) => res.send("ACTIVE"));
+app.get('/', (req, res) => res.send("APEX BOT ACTIVE"));
 app.listen(PORT, '0.0.0.0', () => {
-    log(`🚀 FINAL DEPLOY PORT ${PORT}`);
+    log(`🚀 DEPLOYED ON PORT ${PORT}`);
     runScanner();
     cron.schedule('*/1 * * * *', runScanner);
 });
