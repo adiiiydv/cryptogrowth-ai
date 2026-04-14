@@ -1,6 +1,6 @@
 /**
- * APEX HEDGE v22.0 - PRECISION TRADING BUILD
- * Fixes: Status 400 (Decimal Precision & Min Order)
+ * APEX HEDGE v23.0 - STABLE EXECUTION BUILD
+ * Fixes: "Insufficient funds" 400 Errors & Precision
  */
 
 const express = require('express');
@@ -17,10 +17,11 @@ const STATE_FILE = './state.json';
 
 const CONFIG = {
     WATCHLIST: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'DOGEUSDT'],
-    ALLOCATION_PCT: 0.98, // Leave 2% for fees to prevent "Insufficient Funds" 400 errors
+    // CRITICAL FIX: Lowered to 95% to ensure fees are covered
+    ALLOCATION_PCT: 0.95, 
     TP: 2.0, 
     SL: 1.5,
-    MIN_VAL: 5.05 // Slightly higher to ensure we hit exchange minimums
+    MIN_VAL: 5.05 
 };
 
 let activeTrades = [];
@@ -31,12 +32,12 @@ if (fs.existsSync(STATE_FILE)) {
 const log = (m) => console.log(`[${new Date().toLocaleTimeString()}] ${m}`);
 const sign = (body) => crypto.createHmac('sha256', process.env.COINDCX_SECRET_KEY).update(JSON.stringify(body)).digest('hex');
 
-// Coin-specific decimal precision to prevent Status 400
+// Precision fix to stop "Invalid Request" errors
 function formatQty(qty, symbol) {
     if (symbol.includes('BTC')) return Number(qty.toFixed(6));
     if (symbol.includes('ETH')) return Number(qty.toFixed(5));
-    if (symbol.includes('DOGE')) return Number(qty.toFixed(1));
-    return Number(qty.toFixed(2)); // Standard for SOL, BNB, etc.
+    if (symbol.includes('DOGE')) return Number(qty.toFixed(0)); // DOGE must be whole numbers
+    return Number(qty.toFixed(2));
 }
 
 async function getMarket(symbol) {
@@ -55,7 +56,7 @@ async function placeOrder(side, symbol, amount, qtyOverride = null) {
 
         const price = Number(mData.last_price);
         let qty = qtyOverride ? qtyOverride : (amount / price);
-        qty = formatQty(qty, symbol); // Apply precision fix
+        qty = formatQty(qty, symbol);
 
         const body = {
             side,
@@ -74,13 +75,15 @@ async function placeOrder(side, symbol, amount, qtyOverride = null) {
         });
 
         if (res.data && res.data.status !== "error") {
-            log(`✅ ${side.toUpperCase()} EXECUTED: ${mData.market} @ ${price}`);
+            log(`✅ ${side.toUpperCase()} SUCCESS: ${mData.market} Qty: ${qty}`);
             return { price, qty, market: mData.market };
         }
-        log(`❌ EXCH REFUSED: ${JSON.stringify(res.data)}`);
+        
+        // This will now print the EXACT reason if it fails
+        log(`❌ EXCH REJECTED: ${JSON.stringify(res.data)}`);
         return null;
     } catch (e) { 
-        log(`❌ API 400 ERROR: ${JSON.stringify(e.response?.data || e.message)}`);
+        log(`❌ API ERROR: ${JSON.stringify(e.response?.data || e.message)}`);
         return null; 
     }
 }
@@ -93,14 +96,16 @@ async function runScanner() {
         const usdt = bRes.data?.find(b => b.currency === 'USDT' || b.asset === 'USDT');
         const bal = Number(usdt?.balance || usdt?.available_balance || 0);
 
-        log(`--- HEARTBEAT | BAL: $${bal.toFixed(2)} | ACTIVE: ${activeTrades.length} ---`);
+        log(`--- SCAN | BAL: $${bal.toFixed(2)} | ACTIVE: ${activeTrades.length} ---`);
 
-        if (bal < CONFIG.MIN_VAL && activeTrades.length === 0) return;
+        // If your balance drops below $5.00 due to fees, the bot will stop to prevent errors
+        if (bal < 5.00 && activeTrades.length === 0) {
+            log("⚠️ Balance too low for minimum $5 order. Add funds or wait.");
+            return;
+        }
 
-        const ticker = await axios.get('https://public.coindcx.com/exchange/ticker');
-        
         for (const coin of CONFIG.WATCHLIST) {
-            if (activeTrades.some(t => t.symbol === coin)) continue;
+            if (activeTrades.length > 0) break; // Only 1 trade at a time for this balance
             
             const cndl = await axios.get(`https://api.binance.com/api/v3/klines?symbol=${coin}&interval=1m&limit=50`).catch(() => null);
             if (!cndl) continue;
@@ -110,9 +115,9 @@ async function runScanner() {
             const e9 = EMA.calculate({ values: cls, period: 9 }).pop();
             const e21 = EMA.calculate({ values: cls, period: 21 }).pop();
 
-            // Very aggressive entry for your testing
-            if (rsi < 70 || e9 > e21) {
-                log(`🎯 ATTEMPTING BUY: ${coin} (RSI: ${rsi.toFixed(1)})`);
+            if (rsi < 35 || e9 > e21) {
+                log(`🎯 ATTEMPTING BUY: ${coin}`);
+                // Uses 95% of balance to leave room for fees
                 const buy = await placeOrder("buy", coin, bal * CONFIG.ALLOCATION_PCT);
                 if (buy) {
                     activeTrades.push({ symbol: coin, market: buy.market, entry: buy.price, qty: buy.qty });
@@ -121,10 +126,10 @@ async function runScanner() {
                 }
             }
         }
-    } catch (e) { log(`Error: ${e.message}`); }
+    } catch (e) { log(`System Error: ${e.message}`); }
 }
 
-app.get('/', (req, res) => res.send("RUNNING"));
+app.get('/', (req, res) => res.send("BOT RUNNING"));
 app.listen(PORT, '0.0.0.0', () => {
     runScanner();
     cron.schedule('*/1 * * * *', runScanner);
