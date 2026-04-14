@@ -21,7 +21,7 @@ let lastHour = new Date().getHours();
 
 let activeTrades = [];
 let tradeHistory = []; 
-let lastTradePerCoin = {}; // Bug 4 Fix: Cooldown tracker
+let lastTradePerCoin = {}; 
 let lastKnownBal = 0;
 let lossStreak = 0;
 let dailyLoss = 0; 
@@ -65,6 +65,7 @@ const getPerformance = () => {
     };
 };
 
+// --- DASHBOARD API ---
 app.get('/status', (req, res) => res.json({ 
     status: lossStreak >= 5 ? "HALTED" : "ACTIVE", 
     activeTrades, 
@@ -87,26 +88,21 @@ const getCandles = async (symbol) => {
     } catch { return []; }
 };
 
-// --- EXECUTION ENGINE ---
 async function executeOrder(side, symbol, amount, exactQty = null) {
     try {
-        if (side === "buy" && amount < 1.5) return null;
+        if (side === "buy" && amount < 1.0) return null; // Small balance friendly
         const ticker = await axios.get(`https://api.coindcx.com/exchange/v1/markets/ticker?pair=${symbol}USDT`);
-        
-        // Bug 6 Fix: Spread awareness (Add 0.1% buffer to price for market orders)
         let price = parseFloat(ticker.data.last_price);
         const bufferedPrice = side === "buy" ? price * 1.001 : price * 0.999;
-        
         const qty = exactQty ? Number(exactQty.toFixed(getPrecision(symbol))) : Number((amount / bufferedPrice).toFixed(getPrecision(symbol)));
+        
         if (!qty || qty <= 0) return null;
 
         const body = { side, order_type: "market_order", market: `${symbol}USDT`, total_quantity: qty, timestamp: Date.now() };
-        
-        // Bug 1 Fix: Correct Endpoint
         await axios.post('https://api.coindcx.com/exchange/v1/orders/create', body, {
             headers: { 'X-AUTH-APIKEY': process.env.COINDCX_API_KEY, 'X-AUTH-SIGNATURE': signDCX(body) }
         });
-        return { price: price, qty }; // Store actual last_price as entry for PnL accuracy
+        return { price: price, qty };
     } catch (e) {
         botLog(`❌ Order Error: ${e.response?.data?.message || e.message}`);
         return null;
@@ -118,7 +114,8 @@ const runScanner = async () => {
     const currentHour = new Date().getHours();
     if (currentHour !== lastHour) { tradesThisHour = 0; lastHour = currentHour; }
 
-    // Balance check
+    if (lossStreak >= 5) return botLog("🛑 BOT HALTED: Loss Streak hit 5");
+
     try {
         const body = { timestamp: Date.now() }; 
         const bRes = await axios.post('https://api.coindcx.com/exchange/v1/users/balances', body, {
@@ -138,9 +135,6 @@ const runScanner = async () => {
     }
 
     for (const coin of WATCHLIST) {
-        // Bug 4 Fix: 60s Cooldown check
-        if (Date.now() - (lastTradePerCoin[coin] || 0) < 60000) continue;
-
         const candles = await getCandles(coin);
         if (candles.length < 30) continue;
 
@@ -154,9 +148,11 @@ const runScanner = async () => {
         const volatility = (atr / closes.at(-1)) * 100;
         const score = (rsi < 60 ? 1 : 0) + (isBull ? 1 : 0) + (closes.at(-1) > closes.at(-2) ? 1 : 0) + (volatility > 0.1 ? 1 : 0);
 
+        // ✅ DATA VISIBILITY: Log stats BEFORE any filters
         botLog(`📊 ${coin.padEnd(5)} | RSI: ${safe(rsi,1)} | Score: ${score}/4 | ${isBull ? "🟢" : "🔴"}`);
 
-        // Bug 5 Fix: Log rejection
+        // FILTER CHECK AFTER LOGGING
+        if (Date.now() - (lastTradePerCoin[coin] || 0) < 60000) continue; 
         if (score < 3) {
             botLog(`❌ SKIP ${coin} | Score too low`);
             continue;
@@ -165,22 +161,14 @@ const runScanner = async () => {
         if (tradesThisHour >= TARGET_TRADES_PER_HOUR || activeTrades.length >= 4) continue;
         if (activeTrades.find(t => t.symbol === coin)) continue;
 
-        if (score >= 3 && marketIsBullish && lastKnownBal > 1.5) {
-            // Bug 2 Fix: 25% Risk per trade
+        if (score >= 3 && marketIsBullish && lastKnownBal > 1.2) {
             const tradeAmt = (lastKnownBal * 0.25).toFixed(2);
-            
             const bought = await executeOrder("buy", coin, tradeAmt);
             if (bought) {
                 activeTrades.push({ 
-                    symbol: coin, 
-                    entry: bought.price, 
-                    qty: bought.qty, 
-                    highest: bought.price, 
-                    // Bug 3 Fix: ATR Crash Protection
+                    symbol: coin, entry: bought.price, qty: bought.qty, highest: bought.price, 
                     stop: atr ? atr * 1.5 : bought.price * 0.015 
                 });
-                
-                // Bug 4 Fix: Set cooldown timestamp
                 lastTradePerCoin[coin] = Date.now();
                 tradesThisHour++;
                 saveState();
@@ -219,7 +207,7 @@ async function checkExits(t, idx) {
 }
 
 app.listen(PORT, '0.0.0.0', () => {
-    botLog(`✅ APEX PRO v11.9.8 FIXED | PORT ${PORT}`);
+    botLog(`✅ APEX PRO v11.9.9 FULL RECOVERY | PORT ${PORT}`);
     runScanner();
     cron.schedule('*/30 * * * * *', runScanner);
 });
