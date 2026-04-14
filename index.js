@@ -2,40 +2,44 @@ const express = require('express');
 const axios = require('axios');
 const crypto = require('crypto');
 const cron = require('node-cron');
-const fs = require('fs'); // For State Recovery
+const fs = require('fs');
 const { RSI, EMA, ATR } = require('technicalindicators');
 require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// --- DYNAMIC CONFIG & WATCHLIST ---
-const WATCHLIST = ['BTC', 'ETH', 'SOL', 'BNB', 'DOGE', 'MATIC', 'ADA', 'XRP']; // 8 Coins
-const TRADE_LOG_FILE = './trade_journal.json';
-const STATE_FILE = './bot_state.json';
+// --- 1. CLARITY LOGGING & STATUS ---
+app.get('/', (req, res) => res.json({ status: "Live", active: activeTrades.length, balance: lastKnownBal }));
+app.listen(PORT, '0.0.0.0', () => console.log(`✅ PORT BINDING SUCCESS: Listening on ${PORT}`));
 
+// --- 2. GLOBAL CONFIG & WATCHLIST ---
+const WATCHLIST = ['BTC', 'ETH', 'SOL', 'BNB', 'DOGE', 'MATIC', 'ADA', 'XRP'];
+const STATE_FILE = './bot_state.json';
 let activeTrades = [];
 let lastTradePerCoin = {};
-let tradesThisHour = 0;
-let dailyKillSwitch = false;
-const MAX_TRADES = 4;
-const FEES_SPREAD_ADJ = 0.25; // 0.25% buffer for fees/slippage
+let lastKnownBal = 0;
 
-// --- STARTUP STATE RECOVERY ---
+// Precision Map to solve the "DOGE Code 400" error
+const getPrecision = (symbol) => {
+    const map = { 'DOGE': 4, 'BTC': 5, 'ETH': 5, 'XRP': 2, 'ADA': 2, 'MATIC': 2, 'SOL': 2, 'BNB': 2 };
+    return map[symbol] || 2;
+};
+
+// --- 3. STATE RECOVERY ---
 if (fs.existsSync(STATE_FILE)) {
-    activeTrades = JSON.parse(fs.readFileSync(STATE_FILE));
-    console.log(`🔄 RECOVERY: Resumed ${activeTrades.length} open positions.`);
+    try {
+        activeTrades = JSON.parse(fs.readFileSync(STATE_FILE));
+        console.log(`🔄 RECOVERED: ${activeTrades.length} trades back in memory.`);
+    } catch (e) { activeTrades = []; }
 }
-
 const saveState = () => fs.writeFileSync(STATE_FILE, JSON.stringify(activeTrades));
 
-// --- UTILITIES ---
+// --- 4. CORE UTILITIES ---
 const signDCX = (body) => {
     const payload = Buffer.from(JSON.stringify(body)).toString();
     return crypto.createHmac('sha256', process.env.COINDCX_SECRET_KEY).update(payload).digest('hex');
 };
-
-const getPrecision = (s) => (['DOGE'].includes(s) ? 4 : ['BTC', 'ETH'].includes(s) ? 5 : 2);
 
 const getCandles = async (symbol, interval = "1m") => {
     try {
@@ -48,53 +52,67 @@ const getCandles = async (symbol, interval = "1m") => {
     } catch { return []; }
 };
 
-// --- EXECUTION ENGINE (With Error Handling) ---
+// --- 5. EXECUTION ENGINE (The Precision Fix) ---
 async function executeOrder(side, symbol, amount, exactQty = null) {
     try {
         if (side === "buy" && amount < 4 && !exactQty) return null;
 
         const ticker = await axios.get(`https://api.coindcx.com/exchange/v1/markets/ticker?pair=${symbol}USDT`);
         const price = parseFloat(ticker.data.last_price);
-        const qty = exactQty ? Number(exactQty.toFixed(getPrecision(symbol))) : Number((amount / price).toFixed(getPrecision(symbol)));
+        
+        // FIX: Mapping precision before rounding
+        const precision = getPrecision(symbol);
+        const qty = exactQty ? 
+            Number(exactQty.toFixed(precision)) : 
+            Number((amount / price).toFixed(precision));
 
-        const body = { side, order_type: "market_order", market: `${symbol}USDT`, total_quantity: qty, timestamp: Date.now() };
-        const res = await axios.post('https://api.coindcx.com/exchange/v1/orders/create', body, {
-            headers: { 'X-AUTH-APIKEY': process.env.COINDCX_API_KEY, 'X-AUTH-SIGNATURE': signDCX(body) }
+        if (!qty || qty <= 0) return null;
+
+        const body = { 
+            side, 
+            order_type: "market_order", 
+            market: `${symbol}USDT`, 
+            total_quantity: qty, 
+            timestamp: Date.now() 
+        };
+
+        await axios.post('https://api.coindcx.com/exchange/v1/orders/create', body, {
+            headers: { 
+                'X-AUTH-APIKEY': process.env.COINDCX_API_KEY, 
+                'X-AUTH-SIGNATURE': signDCX(body) 
+            }
         });
 
-        console.log(`🎯 ${side.toUpperCase()} CONFIRMED: ${symbol} @ ${price}`);
+        console.log(`🎯 ${side.toUpperCase()} SUCCESS: ${symbol} | Qty: ${qty} | Price: ${price}`);
         return { price, qty };
     } catch (e) {
-        console.log(`❌ ORDER REJECTED [${symbol}]:`, e.response?.data || e.message);
+        console.log(`❌ ORDER REJECTED [${symbol}]:`, e.response?.data?.message || e.message);
         return null;
     }
 }
 
-// --- SCANNER (High Frequency / 4 per hour intent) ---
+// --- 6. SCANNER & LOGIC ---
 const runScanner = async () => {
-    if (dailyKillSwitch) return;
-
-    // Maintenance: Check Exits
+    // Exit Check
     for (let i = activeTrades.length - 1; i >= 0; i--) {
         await checkExits(activeTrades[i], i);
     }
 
-    if (activeTrades.length >= MAX_TRADES) return;
+    if (activeTrades.length >= 4) return;
 
-    // Fetch Balance
-    let balance = 0;
+    // Balance Check
     try {
         const body = { timestamp: Date.now() };
         const bRes = await axios.post('https://api.coindcx.com/exchange/v1/users/balances', body, {
             headers: { 'X-AUTH-APIKEY': process.env.COINDCX_API_KEY, 'X-AUTH-SIGNATURE': signDCX(body) }
         });
         const usdt = bRes.data.find(b => b.currency === 'USDT' || b.asset === 'USDT');
-        if (usdt) balance = parseFloat(usdt.balance) - parseFloat(usdt.locked_balance || 0);
+        lastKnownBal = usdt ? parseFloat(usdt.balance) - parseFloat(usdt.locked_balance || 0) : 0;
     } catch (e) { return; }
 
     for (const coin of WATCHLIST) {
         if (activeTrades.find(t => t.symbol === coin)) continue;
-        if (Date.now() - (lastTradePerCoin[coin] || 0) < 60000) continue; // 1m per-coin cooldown
+        if (Date.now() - (lastTradePerCoin[coin] || 0) < 90000) continue; 
 
         const candles = await getCandles(coin, "1m");
         if (candles.length < 30) continue;
@@ -106,23 +124,13 @@ const runScanner = async () => {
         const atr = ATR.calculate({ high: candles.map(c => c.high), low: candles.map(c => c.low), close: closes, period: 14 }).pop();
 
         let score = 0;
-        const reason = [];
+        if (rsi < 65) score++;
+        if (ema9 > ema21) score++;
+        if (closes[closes.length - 1] > closes[closes.length - 2]) score++;
 
-        if (rsi < 65) { score++; reason.push("RSI_OK"); }
-        if (ema9 > ema21) { score++; reason.push("EMA_CROSS"); }
-        if (closes[closes.length - 1] > closes[closes.length - 2]) { score++; reason.push("MOMENTUM"); }
-        
-        // 15m Trend is now a BONUS, not mandatory
-        const hRes = await getCandles(coin, "15m");
-        if (hRes.length > 20) {
-            const hE9 = EMA.calculate({ values: hRes.map(c => c.close), period: 9 }).pop();
-            const hE21 = EMA.calculate({ values: hRes.map(c => c.close), period: 21 }).pop();
-            if (hE9 > hE21) { score += 2; reason.push("HTF_BULL"); }
-        }
-
-        // ENTRY: Score 3+ (High Frequency)
-        if (score >= 3 && balance > 5) {
-            const tradeAmt = (balance * 0.30).toFixed(2); // Risk 30% per trade
+        // ENTRY (Score 2+ for high activity)
+        if (score >= 2 && lastKnownBal > 5) {
+            const tradeAmt = Math.min(lastKnownBal * 0.35, lastKnownBal - 0.1).toFixed(2);
             const bought = await executeOrder("buy", coin, tradeAmt);
             if (bought) {
                 activeTrades.push({
@@ -130,19 +138,16 @@ const runScanner = async () => {
                     entry: bought.price,
                     qty: bought.qty,
                     highest: bought.price,
-                    stop: atr * 1.5,
-                    time: Date.now()
+                    stop: Math.min(atr * 1.5, bought.price * 0.012) // Max 1.2% stop
                 });
                 lastTradePerCoin[coin] = Date.now();
-                tradesThisHour++;
                 saveState();
-                console.log(`✅ ENTRY ${coin} | Score: ${score} | Reasons: ${reason.join(",")}`);
             }
         }
     }
 };
 
-// --- DYNAMIC EXIT (Profit Lock & Fees) ---
+// --- 7. EXIT STRATEGY ---
 async function checkExits(t, idx) {
     try {
         const ticker = await axios.get(`https://api.coindcx.com/exchange/v1/markets/ticker?pair=${t.symbol}USDT`);
@@ -153,17 +158,12 @@ async function checkExits(t, idx) {
         const drop = ((t.highest - p) / t.highest) * 100;
         const stopPercent = (t.stop / t.entry) * 100;
 
-        // Profit Lock: If gain > 1%, don't let it turn into a loss
-        const trail = gain > 1.2 ? 0.3 : 0.6;
+        // Profit Trailing
+        const trail = gain > 1.0 ? 0.3 : 0.5;
         
-        if ((gain > 0.8 && drop > trail) || gain < -(stopPercent + FEES_SPREAD_ADJ)) {
+        if ((gain > 0.7 && drop > trail) || gain < -(stopPercent + 0.2)) {
             const sold = await executeOrder("sell", t.symbol, 0, t.qty);
             if (sold) {
-                const finalGain = gain - FEES_SPREAD_ADJ;
-                console.log(`🚪 EXIT ${t.symbol} | Net Gain: ${finalGain.toFixed(2)}%`);
-                // Journaling
-                const log = `[${new Date().toISOString()}] ${t.symbol} | In: ${t.entry} | Out: ${p} | G: ${finalGain.toFixed(2)}%\n`;
-                fs.appendFileSync(TRADE_LOG_FILE, log);
                 activeTrades.splice(idx, 1);
                 saveState();
             }
@@ -171,15 +171,4 @@ async function checkExits(t, idx) {
     } catch (e) {}
 }
 
-// --- MONITORING (Web UI Alternative) ---
-app.get('/status', (req, res) => {
-    res.json({
-        activeTrades,
-        hourlyTrades: tradesThisHour,
-        globalStats,
-        uptime: process.uptime()
-    });
-});
-
-cron.schedule('0 * * * *', () => { tradesThisHour = 0; }); // Reset hourly count
 cron.schedule('*/15 * * * * *', runScanner);
