@@ -15,6 +15,11 @@ const STATE_FILE = './bot_state.json';
 const LOG_FILE = './trades.log';
 const FEES = 0.25; 
 
+// Hourly Quota Settings
+const TRADE_TARGET_PER_HOUR = 4;
+let tradesThisHour = 0;
+let lastHour = new Date().getHours();
+
 let activeTrades = [];
 let tradeHistory = []; 
 let lastTradePerCoin = {};
@@ -43,9 +48,12 @@ app.get('/status', (req, res) => res.json({
     activeTrades, 
     balance: lastKnownBal, 
     streak: lossStreak,
-    dailyLoss: dailyLoss.toFixed(2)
+    dailyLoss: dailyLoss.toFixed(2),
+    tradesThisHour
 }));
+
 app.get('/history', (req, res) => res.json(tradeHistory));
+
 app.get('/indicators/:coin', async (req, res) => {
     const candles = await getCandles(req.params.coin);
     if (candles.length < 30) return res.json({});
@@ -77,7 +85,7 @@ const getCandles = async (symbol) => {
 // --- EXECUTION ENGINE ---
 async function executeOrder(side, symbol, amount, exactQty = null) {
     try {
-        if (side === "buy" && amount < 4 && !exactQty) return null;
+        if (side === "buy" && amount < 2 && !exactQty) return null; // Adjusted for micro-balance
         const ticker = await axios.get(`https://api.coindcx.com/exchange/v1/markets/ticker?pair=${symbol}USDT`);
         const price = parseFloat(ticker.data.last_price);
         const qty = exactQty ? Number(exactQty.toFixed(getPrecision(symbol))) : Number((amount / price).toFixed(getPrecision(symbol)));
@@ -96,9 +104,16 @@ async function executeOrder(side, symbol, amount, exactQty = null) {
 
 // --- MAIN SCANNER ---
 const runScanner = async () => {
-    botLog("🔍 Starting Deep Market Scan...");
+    const currentHour = new Date().getHours();
+    if (currentHour !== lastHour) {
+        tradesThisHour = 0;
+        lastHour = currentHour;
+    }
+
+    botLog(`🔍 Deep Scan | Hour Quota: ${tradesThisHour}/${TRADE_TARGET_PER_HOUR}`);
     
-    if (lossStreak >= 5) return botLog("🛑 KILL SWITCH: 5 Losses.");
+    if (lossStreak >= 5) return botLog("🛑 STOP: Loss streak hit");
+    if (tradesThisHour >= TRADE_TARGET_PER_HOUR) return botLog("⏳ Trade quota reached for this hour");
 
     // 1. Balance Refresh
     try {
@@ -109,9 +124,9 @@ const runScanner = async () => {
         const usdt = bRes.data.find(b => b.currency === 'USDT' || b.asset === 'USDT');
         lastKnownBal = usdt ? parseFloat(usdt.balance) - parseFloat(usdt.locked_balance || 0) : 0;
         botLog(`💰 Wallet Balance: $${lastKnownBal.toFixed(2)} USDT`);
-    } catch (e) { return botLog("⚠️ Balance Error."); }
+    } catch (e) { return botLog("⚠️ Balance Error"); }
 
-    if (dailyLoss > lastKnownBal * 0.05) return botLog("🛑 Daily loss limit (5%) hit.");
+    if (dailyLoss > (lastKnownBal + dailyLoss) * 0.05) return botLog("🛑 Daily loss limit (5%) hit.");
 
     // 2. BTC Market Regime
     let marketIsBullish = true;
@@ -119,16 +134,16 @@ const runScanner = async () => {
     if (btcCandles.length > 21) {
         const btcCloses = btcCandles.map(c => c.close);
         const btcTrend = EMA.calculate({ values: btcCloses, period: 21 }).pop();
-        if (btcCloses[btcCloses.length - 1] < btcTrend) {
-            marketIsBullish = false;
-            botLog("🐻 Market Status: BEARISH (BTC below EMA21)");
-        } else {
-            botLog("🚀 Market Status: BULLISH");
-        }
+        marketIsBullish = btcCloses[btcCloses.length - 1] > btcTrend;
+        botLog(marketIsBullish ? "🚀 Market: BULLISH" : "🐻 Market: BEARISH");
     }
 
-    // 3. Scan Watchlist & Log Indicators
+    // 3. Scan Watchlist
     for (const coin of WATCHLIST) {
+        if (activeTrades.length >= 4) break;
+        if (activeTrades.find(t => t.symbol === coin)) continue;
+        if (Date.now() - (lastTradePerCoin[coin] || 0) < 45000) continue; // 45s Cooldown
+
         const candles = await getCandles(coin);
         if (candles.length < 30) continue;
 
@@ -138,22 +153,22 @@ const runScanner = async () => {
         const rsi = RSI.calculate({ values: closes, period: 14 }).pop();
         const atr = ATR.calculate({ high: candles.map(c => c.high), low: candles.map(c => c.low), close: closes, period: 14 }).pop();
 
-        const trendStrength = Math.abs(ema9 - ema21) / closes[closes.length - 1] * 100;
-        const fastMomentum = (closes[closes.length-1] - closes[closes.length-2]) / closes[closes.length-2] * 100;
-        const volatility = (atr / closes[closes.length-1]) * 100;
         const isBull = ema9 > ema21;
-        let score = (rsi < 60 ? 1 : 0) + (isBull ? 1 : 0) + (closes[closes.length - 1] > closes[closes.length - 2] ? 1 : 0);
+        const momentum = closes.at(-1) > closes.at(-2);
+        const volatility = (atr / closes[closes.length-1]) * 100;
+        let score = (rsi < 60 ? 1 : 0) + (isBull ? 1 : 0) + (momentum ? 1 : 0);
 
-        // --- VERBOSE LOGGING ---
-        botLog(`📊 ${coin.padEnd(5)} | Price: ${closes[closes.length-1]} | RSI: ${safe(rsi, 1)} | Trend: ${isBull ? "🟢" : "🔴"} | Score: ${score}/3 | Vol: ${volatility.toFixed(2)}%`);
+        // --- ALWAYS LOG ANALYTICS ---
+        botLog(`📊 ${coin.padEnd(5)} | RSI: ${safe(rsi, 1)} | Trend: ${isBull ? "🟢" : "🔴"} | Score: ${score}/3 | Vol: ${volatility.toFixed(2)}%`);
 
-        // 4. Entry Logic
-        if (score >= 2 && isBull && marketIsBullish && rsi < 70 && trendStrength > 0.05 && fastMomentum > 0.03 && volatility > 0.08 && lastKnownBal > 5) {
-            if (activeTrades.length >= 4) continue;
-            if (activeTrades.find(t => t.symbol === coin)) continue;
-            if (Date.now() - (lastTradePerCoin[coin] || 0) < 90000) continue;
+        // 4. Relaxed Entry Logic (Micro-Balance Friendly)
+        if (score >= 2 && isBull && marketIsBullish && rsi < 65 && volatility > 0.08) {
+            if (lastKnownBal < 2) {
+                botLog(`⚠️ ${coin}: Signal valid, but balance < $2`);
+                continue;
+            }
 
-            const tradeAmt = (lastKnownBal * 0.15).toFixed(2);
+            const tradeAmt = (lastKnownBal * 0.90).toFixed(2); // Use 90% of micro-balance
             const bought = await executeOrder("buy", coin, tradeAmt);
             if (bought) {
                 activeTrades.push({ 
@@ -161,8 +176,9 @@ const runScanner = async () => {
                     stop: atr ? atr * 1.2 : bought.price * 0.012 
                 });
                 lastTradePerCoin[coin] = Date.now();
+                tradesThisHour++;
                 saveState();
-                botLog(`🚀 EXECUTED BUY: ${coin} @ ${bought.price}`);
+                botLog(`🚀 BUY SUCCESS: ${coin} @ ${bought.price} | Hour: ${tradesThisHour}`);
                 fs.appendFileSync(LOG_FILE, `🚀 BUY: ${coin} @ ${bought.price}\n`);
             }
         }
@@ -177,23 +193,27 @@ async function checkExits(t, idx) {
         const ticker = await axios.get(`https://api.coindcx.com/exchange/v1/markets/ticker?pair=${t.symbol}USDT`);
         const p = parseFloat(ticker.data.last_price);
         if (p > t.highest) t.highest = p;
+
         const gain = ((p - t.entry) / t.entry) * 100;
         const drop = ((t.highest - p) / t.highest) * 100;
         const stopPct = (t.stop / t.entry) * 100;
 
-        if ((gain > (0.7 + FEES) && drop > 0.3) || gain < -stopPct) {
+        // FAST EXIT FOR HIGH TURNOVER
+        if ((gain > (0.5 + FEES) && drop > 0.2) || gain < -stopPct) {
             const sold = await executeOrder("sell", t.symbol, 0, t.qty);
             if (sold) {
                 const pnlUSDT = (p - t.entry) * t.qty;
                 if (gain < 0) dailyLoss += Math.abs(pnlUSDT);
                 lossStreak = (gain <= 0) ? lossStreak + 1 : 0;
+                
                 tradeHistory.push({
                     symbol: t.symbol, entry: t.entry, exit: p,
                     pnl: pnlUSDT.toFixed(2), percent: gain.toFixed(2), time: new Date().toLocaleTimeString()
                 });
+
                 activeTrades.splice(idx, 1);
                 saveState();
-                botLog(`🚪 SOLD: ${t.symbol} | PnL: ${gain.toFixed(2)}%`);
+                botLog(`💰 SOLD: ${t.symbol} | Gain: ${gain.toFixed(2)}% | PnL: $${pnlUSDT.toFixed(2)}`);
                 fs.appendFileSync(LOG_FILE, `🚪 SELL: ${t.symbol} | PnL: ${gain.toFixed(2)}% ($${pnlUSDT.toFixed(2)})\n`);
             }
         }
@@ -201,7 +221,7 @@ async function checkExits(t, idx) {
 }
 
 app.listen(PORT, '0.0.0.0', () => {
-    botLog(`✅ APEX PRO v11.9.2 DEEP SCAN LIVE | PORT ${PORT}`);
+    botLog(`✅ APEX PRO v11.9.4 HYPER-AGGRESSIVE LIVE | PORT ${PORT}`);
     runScanner();
     cron.schedule('*/30 * * * * *', runScanner);
 });
