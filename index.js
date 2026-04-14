@@ -10,7 +10,8 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // --- CONFIG & STATE ---
-const WATCHLIST = ['BTC', 'ETH', 'SOL', 'BNB', 'DOGE', 'MATIC', 'ADA', 'XRP'];
+// Updated Watchlist to match CoinDCX precise naming
+const WATCHLIST = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'DOGEUSDT', 'MATICUSDT', 'ADAUSDT', 'XRPUSDT'];
 const STATE_FILE = './bot_state.json';
 const LOG_FILE = './trades.log';
 const FEES = 0.25; 
@@ -46,7 +47,7 @@ if (fs.existsSync(STATE_FILE)) {
     try { activeTrades = JSON.parse(fs.readFileSync(STATE_FILE)); } catch (e) { activeTrades = []; }
 }
 const saveState = () => fs.writeFileSync(STATE_FILE, JSON.stringify(activeTrades));
-const getPrecision = (s) => ({ 'DOGE': 4, 'BTC': 5, 'ETH': 5 }[s] || 2);
+const getPrecision = (s) => ({ 'DOGEUSDT': 4, 'BTCUSDT': 5, 'ETHUSDT': 5 }[s] || 2);
 const safe = (v, p = 4) => v ? v.toFixed(p) : "N/A";
 
 const getPerformance = () => {
@@ -81,27 +82,43 @@ app.get('/status', (req, res) => res.json({
 const signDCX = (body) => crypto.createHmac('sha256', process.env.COINDCX_SECRET_KEY)
     .update(Buffer.from(JSON.stringify(body)).toString()).digest('hex');
 
-const getCandles = async (symbol) => {
+// Pro-Fix for the "Waiting for Data" Bug
+const getCandles = async (pair) => {
     try {
-        const res = await axios.get(`https://public.coindcx.com/market_data/candles?pair=${symbol}USDT&interval=1m`);
-        return Array.isArray(res.data) ? res.data.map(d => ({ 
+        const url = `https://public.coindcx.com/market_data/candles?pair=${pair}&interval=1m&limit=50`;
+        const res = await axios.get(url, { timeout: 5000 });
+        
+        if (res.data && Array.isArray(res.data) && res.data.length > 0) {
+            return res.data.map(d => ({ 
+                close: parseFloat(d.close), 
+                high: parseFloat(d.high), 
+                low: parseFloat(d.low) 
+            })).reverse();
+        }
+        
+        // Fallback: If 1m fails, try 5m to get data flow
+        const fallbackRes = await axios.get(url.replace('interval=1m', 'interval=5m'));
+        return (fallbackRes.data || []).map(d => ({ 
             close: parseFloat(d.close), high: parseFloat(d.high), low: parseFloat(d.low) 
-        })).reverse() : [];
-    } catch { return []; }
+        })).reverse();
+        
+    } catch (e) {
+        return []; 
+    }
 };
 
 // --- EXECUTION ENGINE ---
 async function executeOrder(side, symbol, amount, exactQty = null) {
     try {
         if (side === "buy" && amount < 1.0) return null;
-        const ticker = await axios.get(`https://api.coindcx.com/exchange/v1/markets/ticker?pair=${symbol}USDT`);
+        const ticker = await axios.get(`https://api.coindcx.com/exchange/v1/markets/ticker?pair=${symbol}`);
         let price = parseFloat(ticker.data.last_price);
         const bufferedPrice = side === "buy" ? price * 1.001 : price * 0.999;
         const qty = exactQty ? Number(exactQty.toFixed(getPrecision(symbol))) : Number((amount / bufferedPrice).toFixed(getPrecision(symbol)));
         
         if (!qty || qty <= 0) return null;
 
-        const body = { side, order_type: "market_order", market: `${symbol}USDT`, total_quantity: qty, timestamp: Date.now() };
+        const body = { side, order_type: "market_order", market: symbol, total_quantity: qty, timestamp: Date.now() };
         await axios.post('https://api.coindcx.com/exchange/v1/orders/create', body, {
             headers: { 'X-AUTH-APIKEY': process.env.COINDCX_API_KEY, 'X-AUTH-SIGNATURE': signDCX(body) }
         });
@@ -112,7 +129,7 @@ async function executeOrder(side, symbol, amount, exactQty = null) {
     }
 }
 
-// --- MAIN SCANNER (COMBINED & CORRECTED) ---
+// --- MAIN SCANNER ---
 const runScanner = async () => {
     const currentHour = new Date().getHours();
     if (currentHour !== lastHour) { tradesThisHour = 0; lastHour = currentHour; }
@@ -124,14 +141,14 @@ const runScanner = async () => {
         const bRes = await axios.post('https://api.coindcx.com/exchange/v1/users/balances', body, {
             headers: { 'X-AUTH-APIKEY': process.env.COINDCX_API_KEY, 'X-AUTH-SIGNATURE': signDCX(body) }
         });
-        const usdt = bRes.data.find(b => b.currency === 'USDT' || b.asset === 'USDT');
+        const usdt = (bRes.data || []).find(b => b.currency === 'USDT' || b.asset === 'USDT');
         lastKnownBal = usdt ? parseFloat(usdt.balance) - parseFloat(usdt.locked_balance || 0) : 0;
     } catch (e) { return botLog("⚠️ Balance API Error"); }
 
     botLog(`🔍 SCAN START | Bal: $${lastKnownBal.toFixed(2)} | Quota: ${tradesThisHour}/${TARGET_TRADES_PER_HOUR}`);
 
     let marketIsBullish = true;
-    const btcCandles = await getCandles('BTC');
+    const btcCandles = await getCandles('BTCUSDT');
     if (btcCandles.length > 21) {
         const btcCloses = btcCandles.map(c => c.close);
         marketIsBullish = btcCloses.at(-1) > EMA.calculate({ values: btcCloses, period: 21 }).pop();
@@ -142,7 +159,7 @@ const runScanner = async () => {
             const candles = await getCandles(coin);
             
             if (!candles || candles.length < 30) {
-                botLog(`📡 ${coin.padEnd(5)} | ⚠️ Waiting for data (${candles?.length || 0}/30)`);
+                botLog(`📡 ${coin.replace('USDT','').padEnd(5)} | ⚠️ Waiting for data (${candles?.length || 0}/30)`);
                 continue;
             }
 
@@ -159,16 +176,14 @@ const runScanner = async () => {
             const volatility = (atr / closes.at(-1)) * 100;
             const score = (rsi < 60 ? 1 : 0) + (isBull ? 1 : 0) + (closes.at(-1) > closes.at(-2) ? 1 : 0) + (volatility > 0.1 ? 1 : 0);
 
-            // Visibility Log
-            botLog(`📊 ${coin.padEnd(5)} | RSI: ${safe(rsi, 1)} | Score: ${score}/4 | ${isBull ? "🟢" : "🔴"}`);
+            // Visibility Log with cleaner name
+            botLog(`📊 ${coin.replace('USDT','').padEnd(5)} | RSI: ${safe(rsi, 1)} | Score: ${score}/4 | ${isBull ? "🟢" : "🔴"}`);
 
-            // Safety Filters
             if (activeTrades.find(t => t.symbol === coin)) continue;
             if (Date.now() - (lastTradePerCoin[coin] || 0) < 60000) continue; 
             
             if (score < 3) continue; 
 
-            // Entry Logic (50% risk for CoinDCX minimums)
             if (tradesThisHour < TARGET_TRADES_PER_HOUR && activeTrades.length < 4 && lastKnownBal > 2.0) {
                 const tradeAmt = (lastKnownBal * 0.50).toFixed(2); 
                 const bought = await executeOrder("buy", coin, tradeAmt);
@@ -192,7 +207,7 @@ const runScanner = async () => {
 
 async function checkExits(t, idx) {
     try {
-        const ticker = await axios.get(`https://api.coindcx.com/exchange/v1/markets/ticker?pair=${t.symbol}USDT`);
+        const ticker = await axios.get(`https://api.coindcx.com/exchange/v1/markets/ticker?pair=${t.symbol}`);
         const p = parseFloat(ticker.data.last_price);
         if (p > t.highest) t.highest = p;
 
@@ -217,7 +232,7 @@ async function checkExits(t, idx) {
 }
 
 app.listen(PORT, '0.0.0.0', () => {
-    botLog(`✅ APEX PRO v12.0 CONSOLIDATED | PORT ${PORT}`);
+    botLog(`✅ APEX PRO v12.1 FIXED | PORT ${PORT}`);
     runScanner();
     cron.schedule('*/30 * * * * *', runScanner);
 });
