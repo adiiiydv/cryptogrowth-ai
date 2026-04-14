@@ -9,7 +9,7 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// ================= CONFIG =================
+// ================= CONFIG & RISK MGMT =================
 const STATE_FILE = './state.json';
 const WATCHLIST = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'DOGEUSDT', 'MATICUSDT'];
 const ALLOCATION_PCT = 0.70; 
@@ -32,6 +32,7 @@ if (fs.existsSync(STATE_FILE)) {
 const log = (m) => console.log(`[${new Date().toLocaleTimeString()}] ${m}`);
 const sign = (body) => crypto.createHmac('sha256', process.env.COINDCX_SECRET_KEY).update(JSON.stringify(body)).digest('hex');
 
+// ================= UTILITIES =================
 async function safeGet(url, timeout = 25000) {
     try {
         const res = await axios.get(url, { timeout });
@@ -41,31 +42,28 @@ async function safeGet(url, timeout = 25000) {
     }
 }
 
-// ================= FIXED ORDER ENGINE =================
+// ================= UNIFIED ORDER ENGINE =================
 async function placeOrder(side, symbol, amount, qtyOverride = null) {
     try {
         const coin = symbol.replace("USDT", "");
         
-        // 1. Get Stable Ticker for Price Discovery
+        // 1. Fetch Market Ticker
         const tickerData = await safeGet('https://public.coindcx.com/exchange/ticker');
-        if (!tickerData) {
-            log(`❌ Ticker fetch failed - check internet connection`);
-            return null;
-        }
+        if (!Array.isArray(tickerData)) return null;
 
-        // 2. Smart Market Mapping (Handles B- prefix and standard USDT pairs)
+        // 2. Smart Market Mapping (Handles standard and B- prefixes)
         const market = tickerData.find(m => 
             m.market === `${coin}USDT` || 
-            m.market === `B-${coin}_USDT` || 
+            m.market === `B-${coin}_USDT` ||
             (m.market.includes(coin) && m.market.includes("USDT"))
         );
         
-        if (!market) {
-            log(`❌ Market mapping failed for ${coin}`);
+        if (!market || !market.last_price) {
+            log(`❌ Market Not Found: ${coin}`);
             return null;
         }
 
-        const price = parseFloat(market.last_price);
+        const price = Number(market.last_price);
         const qty = qtyOverride ? Number(qtyOverride.toFixed(5)) : Number((amount / price).toFixed(5));
 
         const body = {
@@ -76,7 +74,7 @@ async function placeOrder(side, symbol, amount, qtyOverride = null) {
             timestamp: Date.now()
         };
 
-        // 3. Execute Order
+        // 3. API Execution
         const res = await axios.post("https://api.coindcx.com/exchange/v1/orders/create", body, {
             headers: { 
                 "X-AUTH-APIKEY": process.env.COINDCX_API_KEY, 
@@ -86,7 +84,7 @@ async function placeOrder(side, symbol, amount, qtyOverride = null) {
             timeout: 30000
         });
 
-        if (res.data && res.data.status !== "error") {
+        if (res.data && res.data.status !== "error" && res.data.order_id) {
             log(`✅ ${side.toUpperCase()} SUCCESS: ${market.market} @ ${price}`);
             return { price, qty, market: market.market };
         } else {
@@ -94,12 +92,12 @@ async function placeOrder(side, symbol, amount, qtyOverride = null) {
             return null;
         }
     } catch (e) { 
-        log(`❌ API/NETWORK ERROR: ${e.message}`); 
+        log(`❌ ORDER ENGINE CRITICAL ERROR: ${e.message}`); 
         return null; 
     }
 }
 
-// ================= SCANNER WITH ANALYTICS =================
+// ================= ANALYTIC SCANNER =================
 async function runScanner() {
     if (isRunning) return;
     isRunning = true;
@@ -112,78 +110,88 @@ async function runScanner() {
                 "X-AUTH-APIKEY": process.env.COINDCX_API_KEY, 
                 "X-AUTH-SIGNATURE": sign(bBody) 
             },
-            timeout: 15000
+            timeout: 20000
         }).catch(() => null);
         
         const usdt = bRes?.data?.find(b => b.currency === 'USDT' || b.asset === 'USDT');
-        lastKnownBal = usdt ? parseFloat(usdt.balance) : 0;
+        lastKnownBal = usdt ? Number(usdt.balance) : 0;
 
-        log(`--- MARKET SCAN (Bal: $${lastKnownBal.toFixed(2)}) ---`);
+        log(`--- SCAN | BAL: $${lastKnownBal.toFixed(2)} | ACTIVE: ${activeTrades.length} ---`);
 
         const tickerData = await safeGet('https://public.coindcx.com/exchange/ticker');
+        if (!Array.isArray(tickerData)) {
+            isRunning = false;
+            return;
+        }
 
-        // 2. Monitoring Active Trades (Exit Logic)
+        // 2. Monitoring Active Trades (Exit System)
         for (let i = activeTrades.length - 1; i >= 0; i--) {
             const t = activeTrades[i];
-            const m = tickerData?.find(x => x.market === t.market);
+            const m = tickerData.find(x => x.market === t.market);
             if (!m) continue;
 
-            const price = parseFloat(m.last_price);
+            const price = Number(m.last_price);
             const pnl = ((price - t.entry) / t.entry) * 100;
             
-            log(`📈 ACTIVE: ${t.symbol} | PNL: ${pnl.toFixed(2)}% | Price: ${price}`);
+            log(`📈 TRADE: ${t.symbol} | PNL: ${pnl.toFixed(2)}% | Price: ${price}`);
 
             if (pnl <= -STOP_LOSS_PCT || pnl >= TAKE_PROFIT_PCT) {
                 const sold = await placeOrder("sell", t.symbol, 0, t.qty);
                 if (sold) { 
                     activeTrades.splice(i, 1); 
-                    fs.writeFileSync(STATE_FILE, JSON.stringify(activeTrades)); 
+                    fs.writeFileSync(STATE_FILE, JSON.stringify(activeTrades, null, 2)); 
                 }
             }
         }
 
-        // 3. Signal Detection (Entry Logic)
+        // 3. Signal Detection (Entry System)
         for (const coin of WATCHLIST) {
-            if (activeTrades.find(t => t.symbol === coin)) continue;
+            if (activeTrades.some(t => t.symbol === coin)) continue;
 
             const candles = await safeGet(`https://api.binance.com/api/v3/klines?symbol=${coin}&interval=1m&limit=40`);
-            if (!candles || candles.length < 30) continue;
+            if (!Array.isArray(candles) || candles.length < 30) continue;
 
-            const closes = candles.map(c => parseFloat(c[4]));
+            const closes = candles.map(c => Number(c[4]));
             const rsi = RSI.calculate({ values: closes, period: 14 }).pop();
             const ema9 = EMA.calculate({ values: closes, period: 9 }).pop();
             const ema21 = EMA.calculate({ values: closes, period: 21 }).pop();
 
+            if (!rsi || !ema9 || !ema21) continue;
+
+            // Log indicators for visibility
             log(`📊 ${coin.padEnd(8)} | RSI: ${rsi.toFixed(2)} | EMA9: ${ema9.toFixed(2)} | EMA21: ${ema21.toFixed(2)}`);
 
             if (rsi < 60 && ema9 > ema21) {
-                log(`🎯 SIGNAL FOUND: Buying ${coin}...`);
                 const tradeAmt = lastKnownBal * ALLOCATION_PCT;
                 
-                // FIXED: Threshold lowered to $1 to accommodate your current balance
-                if (tradeAmt > 1) {
+                // Safety: Minimum trade amount to prevent micro-order errors
+                if (tradeAmt > 1.5) {
+                    log(`🎯 SIGNAL: Buying ${coin}...`);
                     const buy = await placeOrder("buy", coin, tradeAmt);
                     if (buy) {
-                        activeTrades.push({ symbol: coin, market: buy.market, entry: buy.price, qty: buy.qty });
-                        fs.writeFileSync(STATE_FILE, JSON.stringify(activeTrades));
+                        activeTrades.push({ 
+                            symbol: coin, 
+                            market: buy.market, 
+                            entry: buy.price, 
+                            qty: buy.qty 
+                        });
+                        fs.writeFileSync(STATE_FILE, JSON.stringify(activeTrades, null, 2));
                     }
-                } else {
-                    log(`⚠️ Balance too low to trade (Trade Amount: $${tradeAmt.toFixed(2)})`);
                 }
             }
         }
     } catch (e) { 
-        log(`❌ SCAN ERROR: ${e.message}`); 
+        log(`❌ SCANNER ERROR: ${e.message}`); 
     } finally { 
         isRunning = false; 
     }
 }
 
-// ================= SERVER =================
-app.get('/', (_, res) => res.send("ANALYTICS BOT ACTIVE v16.4"));
+// ================= SERVER BOOT =================
+app.get('/', (_, res) => res.send("APEX UNIFIED BOT v16.5 ACTIVE"));
 
 app.listen(PORT, '0.0.0.0', () => {
-    log(`🚀 v16.4 LIVE | FULL ANALYTICS & SMART MAPPING ACTIVE`);
-    runScanner();
-    cron.schedule('*/1 * * * *', runScanner);
+    log(`🚀 BOT DEPLOYED ON PORT ${PORT}`);
+    runScanner(); // Run immediately on start
+    cron.schedule('*/1 * * * *', runScanner); // Scan every minute
 });
