@@ -9,9 +9,12 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// --- 1. CLARITY LOGGING & STATUS ---
-app.get('/', (req, res) => res.json({ status: "Live", active: activeTrades.length, balance: lastKnownBal }));
-app.listen(PORT, '0.0.0.0', () => console.log(`✅ PORT BINDING SUCCESS: Listening on ${PORT}`));
+// --- 1. RENDER PORT BINDING & MONITORING ---
+// This prevents the "No open ports detected" and "Application exited early" errors
+app.get('/', (req, res) => res.json({ status: "Online", active: activeTrades.length }));
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`✅ SERVER LIVE: Listening on port ${PORT}`);
+});
 
 // --- 2. GLOBAL CONFIG & WATCHLIST ---
 const WATCHLIST = ['BTC', 'ETH', 'SOL', 'BNB', 'DOGE', 'MATIC', 'ADA', 'XRP'];
@@ -20,17 +23,27 @@ let activeTrades = [];
 let lastTradePerCoin = {};
 let lastKnownBal = 0;
 
-// Precision Map to solve the "DOGE Code 400" error
+// Institutional Precision Map: Fixes "DOGE precision should be 4" (Code 400)
 const getPrecision = (symbol) => {
-    const map = { 'DOGE': 4, 'BTC': 5, 'ETH': 5, 'XRP': 2, 'ADA': 2, 'MATIC': 2, 'SOL': 2, 'BNB': 2 };
+    const map = { 
+        'DOGE': 4, 
+        'BTC': 5, 
+        'ETH': 5, 
+        'XRP': 2, 
+        'ADA': 2, 
+        'MATIC': 2, 
+        'SOL': 2, 
+        'BNB': 2 
+    };
     return map[symbol] || 2;
 };
 
 // --- 3. STATE RECOVERY ---
+// Saves trades to a file so they aren't lost when Render restarts
 if (fs.existsSync(STATE_FILE)) {
     try {
         activeTrades = JSON.parse(fs.readFileSync(STATE_FILE));
-        console.log(`🔄 RECOVERED: ${activeTrades.length} trades back in memory.`);
+        console.log(`🔄 RECOVERY: Loaded ${activeTrades.length} open positions.`);
     } catch (e) { activeTrades = []; }
 }
 const saveState = () => fs.writeFileSync(STATE_FILE, JSON.stringify(activeTrades));
@@ -44,15 +57,16 @@ const signDCX = (body) => {
 const getCandles = async (symbol, interval = "1m") => {
     try {
         const res = await axios.get(`https://public.coindcx.com/market_data/candles?pair=${symbol}USDT&interval=${interval}`);
+        if (!Array.isArray(res.data)) return [];
         return res.data.map(d => ({
             close: parseFloat(d.close),
             high: parseFloat(d.high),
             low: parseFloat(d.low)
-        })).reverse();
+        })).reverse(); // DCX returns newest first; reverse for indicators
     } catch { return []; }
 };
 
-// --- 5. EXECUTION ENGINE (The Precision Fix) ---
+// --- 5. EXECUTION ENGINE (Precision & Error Fixed) ---
 async function executeOrder(side, symbol, amount, exactQty = null) {
     try {
         if (side === "buy" && amount < 4 && !exactQty) return null;
@@ -60,7 +74,7 @@ async function executeOrder(side, symbol, amount, exactQty = null) {
         const ticker = await axios.get(`https://api.coindcx.com/exchange/v1/markets/ticker?pair=${symbol}USDT`);
         const price = parseFloat(ticker.data.last_price);
         
-        // FIX: Mapping precision before rounding
+        // APPLY PRECISION FIX
         const precision = getPrecision(symbol);
         const qty = exactQty ? 
             Number(exactQty.toFixed(precision)) : 
@@ -91,16 +105,16 @@ async function executeOrder(side, symbol, amount, exactQty = null) {
     }
 }
 
-// --- 6. SCANNER & LOGIC ---
+// --- 6. SCANNER LOGIC ---
 const runScanner = async () => {
-    // Exit Check
+    // Maintenance: Check current open positions for exit
     for (let i = activeTrades.length - 1; i >= 0; i--) {
         await checkExits(activeTrades[i], i);
     }
 
-    if (activeTrades.length >= 4) return;
+    if (activeTrades.length >= 4) return; // Max concurrent trades
 
-    // Balance Check
+    // Fetch USDT Balance
     try {
         const body = { timestamp: Date.now() };
         const bRes = await axios.post('https://api.coindcx.com/exchange/v1/users/balances', body, {
@@ -112,7 +126,7 @@ const runScanner = async () => {
 
     for (const coin of WATCHLIST) {
         if (activeTrades.find(t => t.symbol === coin)) continue;
-        if (Date.now() - (lastTradePerCoin[coin] || 0) < 90000) continue; 
+        if (Date.now() - (lastTradePerCoin[coin] || 0) < 90000) continue; // 90s Cooldown
 
         const candles = await getCandles(coin, "1m");
         if (candles.length < 30) continue;
@@ -128,7 +142,7 @@ const runScanner = async () => {
         if (ema9 > ema21) score++;
         if (closes[closes.length - 1] > closes[closes.length - 2]) score++;
 
-        // ENTRY (Score 2+ for high activity)
+        // ENTRY: 2/3 Score for higher trade frequency
         if (score >= 2 && lastKnownBal > 5) {
             const tradeAmt = Math.min(lastKnownBal * 0.35, lastKnownBal - 0.1).toFixed(2);
             const bought = await executeOrder("buy", coin, tradeAmt);
@@ -138,7 +152,7 @@ const runScanner = async () => {
                     entry: bought.price,
                     qty: bought.qty,
                     highest: bought.price,
-                    stop: Math.min(atr * 1.5, bought.price * 0.012) // Max 1.2% stop
+                    stop: Math.min(atr * 1.5, bought.price * 0.015) 
                 });
                 lastTradePerCoin[coin] = Date.now();
                 saveState();
@@ -147,7 +161,7 @@ const runScanner = async () => {
     }
 };
 
-// --- 7. EXIT STRATEGY ---
+// --- 7. EXIT STRATEGY (Trailing Stop & ATR) ---
 async function checkExits(t, idx) {
     try {
         const ticker = await axios.get(`https://api.coindcx.com/exchange/v1/markets/ticker?pair=${t.symbol}USDT`);
@@ -158,10 +172,10 @@ async function checkExits(t, idx) {
         const drop = ((t.highest - p) / t.highest) * 100;
         const stopPercent = (t.stop / t.entry) * 100;
 
-        // Profit Trailing
-        const trail = gain > 1.0 ? 0.3 : 0.5;
+        // Dynamic Profit Trailing (Tighter once gain > 1%)
+        const trail = gain > 1.0 ? 0.35 : 0.6;
         
-        if ((gain > 0.7 && drop > trail) || gain < -(stopPercent + 0.2)) {
+        if ((gain > 0.8 && drop > trail) || gain < -(stopPercent + 0.25)) {
             const sold = await executeOrder("sell", t.symbol, 0, t.qty);
             if (sold) {
                 activeTrades.splice(idx, 1);
@@ -171,4 +185,5 @@ async function checkExits(t, idx) {
     } catch (e) {}
 }
 
+// RUN SCANNER EVERY 15 SECONDS
 cron.schedule('*/15 * * * * *', runScanner);
