@@ -116,7 +116,7 @@ const runMultiScanner = async () => {
             if (stats.winRate > 0.55) score++;
             if (marketRegime === "sideways") score--;
 
-            if (score >= 6 && balance > 4 && stats.drawdown < 5) {
+            if (score >= 4 && balance > 4 && stats.drawdown < 5) {
                 const riskFactor = stats.winRate > 0.6 ? 0.45 : 0.30;
                 const tradeAmount = Math.min(balance - 0.1, balance * riskFactor).toFixed(2);
 
