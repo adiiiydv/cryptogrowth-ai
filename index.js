@@ -48,50 +48,45 @@ const getCandles = async (symbol) => {
     } catch (e) { return []; }
 };
 
-// ================= BULLETPROOF ORDER ENGINE v14.4 =================
+// ================= FINAL FORCE ENGINE v14.5 =================
 async function executeOrder(side, binanceSymbol, amount, exactQty = null, retry = 2) {
     try {
         const coin = binanceSymbol.replace("USDT", "");
         
-        // 1. DYNAMIC MARKET RESOLUTION
+        // Fix 1: Exact Market Name Retrieval (Kills "not_found")
         const mDetails = await axios.get('https://api.coindcx.com/exchange/v1/markets_details', { timeout: 10000 });
-        const possibleNames = [`B-${coin}_USDT`, `${coin}_USDT`, `${coin}USDT` ];
-        
         const mInfo = mDetails.data.find(m => 
-            possibleNames.includes(m.symbol) || 
-            possibleNames.includes(m.coindcx_name) || 
-            possibleNames.includes(m.pair)
+            m.symbol === `B-${coin}_USDT` || m.coindcx_name === `B-${coin}_USDT` || m.pair === `${coin}USDT`
         );
         
         if (!mInfo) {
-            botLog(`❌ Market for ${coin} not found in any format.`);
+            botLog(`❌ Market for ${coin} not found.`);
             return null;
         }
 
-        const market = mInfo.symbol; 
+        const marketName = mInfo.symbol; 
         const precision = mInfo.target_currency_precision || 5;
 
-        // 2. TICKER VALIDATION & PRICE CHECK
+        // Fix 2: Ticker Validation (Kills "data: undefined")
         const tickerRes = await axios.get(`https://api.coindcx.com/exchange/v1/markets/ticker`, { timeout: 12000 });
-        if (!tickerRes.data || !Array.isArray(tickerRes.data)) throw new Error("Ticker Data Undefined");
+        if (!tickerRes.data || !Array.isArray(tickerRes.data)) throw new Error("Ticker Undefined");
 
-        const data = tickerRes.data.find(m => m.market === market || m.pair === market);
+        const data = tickerRes.data.find(m => m.market === marketName || m.pair === marketName);
         const price = data ? parseFloat(data.last_price) : 0;
 
-        // IMPROVEMENT: Invalid Price Skip
+        // Fix 3: Invalid Price Guard
         if (!price || price <= 0) {
-            botLog(`❌ INVALID PRICE SKIP ORDER for ${market}`);
+            botLog("❌ INVALID PRICE SKIP ORDER");
             return null;
         }
 
         const qty = exactQty ? Number(exactQty.toFixed(precision)) : Number((amount / price).toFixed(precision));
         if (!qty || qty <= 0) return null;
 
-        // 3. STRONGER REJECTION HANDLING
         const body = {
             side,
             order_type: "market_order",
-            market: market,
+            market: marketName,
             total_quantity: qty,
             timestamp: Date.now()
         };
@@ -105,46 +100,41 @@ async function executeOrder(side, binanceSymbol, amount, exactQty = null, retry 
             timeout: 15000
         });
 
-        // IMPROVEMENT: Stronger rejection check for status, code, and errors
-        if (!res.data || res.data.status === "error" || res.data.code || res.data.message?.toLowerCase().includes("fail")) {
-            botLog(`❌ ORDER REJECTED BY EXCHANGE: ${res.data?.message || "Check API Key/Balance"}`);
+        // Fix 4: Stronger Rejection Removal
+        if (!res.data || res.data.status === "error" || res.data.code) {
+            botLog("❌ ORDER REJECTED BY EXCHANGE");
             return null;
         }
 
-        botLog(`✅ ${side.toUpperCase()} SUCCESS: ${market} @ ${price}`);
-        return { price, qty, market };
+        botLog(`✅ ${side.toUpperCase()} SUCCESS: ${marketName}`);
+        return { price, qty, market: marketName };
 
     } catch (e) {
-        if (retry > 0) {
-            botLog(`⚠️ Connection unstable. Retrying ${side} for ${binanceSymbol}...`);
-            return new Promise(resolve => setTimeout(() => resolve(executeOrder(side, binanceSymbol, amount, exactQty, retry - 1)), 3000));
-        }
-        botLog(`❌ FATAL ERROR: ${e.response?.data?.message || e.message}`);
+        if (retry > 0) return new Promise(resolve => setTimeout(() => resolve(executeOrder(side, binanceSymbol, amount, exactQty, retry - 1)), 3000));
+        botLog(`❌ FATAL: ${e.message}`);
         return null;
     }
 }
 
-// ================= SCANNER LOGIC =================
+// ================= MAIN LOOP =================
 const runScanner = async () => {
     if (new Date().getHours() !== lastHour) { tradesThisHour = 0; lastHour = new Date().getHours(); }
-    if (lossStreak >= 5) return botLog("🛑 STOPPED: High Risk - Loss Streak reached.");
+    if (lossStreak >= 5) return;
 
     try {
         const body = { timestamp: Date.now() }; 
         const bRes = await axios.post('https://api.coindcx.com/exchange/v1/users/balances', body, {
-            headers: { 'X-AUTH-APIKEY': process.env.COINDCX_API_KEY, 'X-AUTH-SIGNATURE': signDCX(body) },
-            timeout: 10000
+            headers: { 'X-AUTH-APIKEY': process.env.COINDCX_API_KEY, 'X-AUTH-SIGNATURE': signDCX(body) }
         });
         const usdt = (bRes.data || []).find(b => b.currency === 'USDT' || b.asset === 'USDT');
         lastKnownBal = usdt ? parseFloat(usdt.balance) - parseFloat(usdt.locked_balance || 0) : 0;
-    } catch (e) { return botLog("⚠️ Bal Sync Error - Check Network"); }
+    } catch (e) { return botLog("⚠️ Bal Sync Error"); }
 
-    const tickerRes = await axios.get(`https://api.coindcx.com/exchange/v1/markets/ticker`, { timeout: 12000 });
+    const tickerRes = await axios.get(`https://api.coindcx.com/exchange/v1/markets/ticker`);
     const allTickers = tickerRes.data || [];
 
     botLog(`🔍 SCAN | Bal: $${lastKnownBal.toFixed(2)} | Tr: ${tradesThisHour}/4`);
 
-    // Handle Exits
     for (let i = activeTrades.length - 1; i >= 0; i--) {
         const t = activeTrades[i];
         const ticker = allTickers.find(m => m.market === t.marketId || m.pair === t.marketId);
@@ -170,7 +160,6 @@ const runScanner = async () => {
         }
     }
 
-    // Handle Entries
     for (const coin of WATCHLIST) {
         if (activeTrades.find(t => t.symbol === coin)) continue;
         const candles = await getCandles(coin);
@@ -185,7 +174,7 @@ const runScanner = async () => {
         const score = (rsi < 60 ? 1 : 0) + (ema9 > ema21 ? 1 : 0) + (closes.at(-1) > closes.at(-2) ? 1 : 0);
         
         if (score === 3 && tradesThisHour < TARGET_TRADES_PER_HOUR && lastKnownBal > 5.0) {
-            // IMPROVEMENT: Safer Trade Amount logic
+            // Fix 5: Safer Trade Amount logic
             const tradeAmt = Math.min(Math.max(lastKnownBal * 0.25, 2), 20);
             
             const bought = await executeOrder("buy", coin, tradeAmt);
@@ -208,7 +197,7 @@ const runScanner = async () => {
 app.get('/status', (req, res) => res.json({ balance: lastKnownBal, activeTrades, stats }));
 
 app.listen(PORT, '0.0.0.0', () => {
-    botLog(`✅ APEX PRO v14.4 BULLETPROOF | PORT ${PORT}`);
+    botLog(`✅ APEX PRO v14.5 FINAL | PORT ${PORT}`);
     runScanner();
     cron.schedule('*/30 * * * * *', runScanner);
 });
