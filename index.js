@@ -13,8 +13,7 @@ async function executeOrder(side, symbol, amount) {
 
         const safePrice = execPrice || price;
         
-        // FIX: Dynamic Precision Logic
-        // DOGE requires 4, others usually accept 5
+        // FIX: Precise rounding for CoinDCX standards
         const precision = (symbol === 'DOGE') ? 4 : 5;
         const qty = Number((amount / safePrice).toFixed(precision));
 
@@ -28,18 +27,17 @@ async function executeOrder(side, symbol, amount) {
 
         console.log(`📤 ${side.toUpperCase()} ${symbol} | QTY: ${qty} | PRECISION: ${precision}`);
 
-        const response = await axios.post('https://api.coindcx.com/exchange/v1/orders/create', body, {
+        await axios.post('https://api.coindcx.com/exchange/v1/orders/create', body, {
             headers: { 
                 'X-AUTH-APIKEY': process.env.COINDCX_API_KEY, 
                 'X-AUTH-SIGNATURE': signDCX(body) 
             }
         });
 
-        console.log(`✅ SUCCESS: ${side} ${symbol} at ${safePrice}`);
+        console.log(`✅ SUCCESS: ${side} ${symbol}`);
         return { price: safePrice, qty };
 
     } catch (e) {
-        // Log the exact message from CoinDCX so we can see if other coins have issues
         console.log("❌ ORDER ERROR:", e.response?.data || e.message);
         return null;
     }
