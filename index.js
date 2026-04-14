@@ -143,7 +143,7 @@ const runScanner = async () => {
         if (closes[closes.length - 1] > closes[closes.length - 2]) score++;
 
         // ENTRY: 2/3 Score for higher trade frequency
-        if (score >= 2 && lastKnownBal > 5) {
+        if (score >= 3 && lastKnownBal > 5) {
             const tradeAmt = Math.min(lastKnownBal * 0.35, lastKnownBal - 0.1).toFixed(2);
             const bought = await executeOrder("buy", coin, tradeAmt);
             if (bought) {
