@@ -16,7 +16,7 @@ const LOG_FILE = './trades.log';
 const FEES = 0.25; 
 
 // Hourly Quota Settings
-const TRADE_TARGET_PER_HOUR = 4;
+const TARGET_TRADES_PER_HOUR = 4;
 let tradesThisHour = 0;
 let lastHour = new Date().getHours();
 
@@ -85,7 +85,7 @@ const getCandles = async (symbol) => {
 // --- EXECUTION ENGINE ---
 async function executeOrder(side, symbol, amount, exactQty = null) {
     try {
-        if (side === "buy" && amount < 2 && !exactQty) return null; // Adjusted for micro-balance
+        if (side === "buy" && amount < 2 && !exactQty) return null;
         const ticker = await axios.get(`https://api.coindcx.com/exchange/v1/markets/ticker?pair=${symbol}USDT`);
         const price = parseFloat(ticker.data.last_price);
         const qty = exactQty ? Number(exactQty.toFixed(getPrecision(symbol))) : Number((amount / price).toFixed(getPrecision(symbol)));
@@ -110,10 +110,10 @@ const runScanner = async () => {
         lastHour = currentHour;
     }
 
-    botLog(`🔍 Deep Scan | Hour Quota: ${tradesThisHour}/${TRADE_TARGET_PER_HOUR}`);
+    botLog(`🔍 Smart Scan | Trades: ${tradesThisHour}/${TARGET_TRADES_PER_HOUR}`);
     
     if (lossStreak >= 5) return botLog("🛑 STOP: Loss streak hit");
-    if (tradesThisHour >= TRADE_TARGET_PER_HOUR) return botLog("⏳ Trade quota reached for this hour");
+    if (tradesThisHour >= TARGET_TRADES_PER_HOUR) return botLog("⏳ Hourly quota reached");
 
     // 1. Balance Refresh
     try {
@@ -126,23 +126,24 @@ const runScanner = async () => {
         botLog(`💰 Wallet Balance: $${lastKnownBal.toFixed(2)} USDT`);
     } catch (e) { return botLog("⚠️ Balance Error"); }
 
-    if (dailyLoss > (lastKnownBal + dailyLoss) * 0.05) return botLog("🛑 Daily loss limit (5%) hit.");
+    if (dailyLoss > (lastKnownBal + dailyLoss) * 0.05) return botLog("🛑 Daily loss limit hit");
 
     // 2. BTC Market Regime
     let marketIsBullish = true;
     const btcCandles = await getCandles('BTC');
     if (btcCandles.length > 21) {
         const btcCloses = btcCandles.map(c => c.close);
-        const btcTrend = EMA.calculate({ values: btcCloses, period: 21 }).pop();
-        marketIsBullish = btcCloses[btcCloses.length - 1] > btcTrend;
+        const btcEMA = EMA.calculate({ values: btcCloses, period: 21 }).pop();
+        marketIsBullish = btcCloses.at(-1) > btcEMA;
         botLog(marketIsBullish ? "🚀 Market: BULLISH" : "🐻 Market: BEARISH");
     }
 
     // 3. Scan Watchlist
     for (const coin of WATCHLIST) {
         if (activeTrades.length >= 4) break;
+        if (tradesThisHour >= TARGET_TRADES_PER_HOUR) break;
         if (activeTrades.find(t => t.symbol === coin)) continue;
-        if (Date.now() - (lastTradePerCoin[coin] || 0) < 45000) continue; // 45s Cooldown
+        if (Date.now() - (lastTradePerCoin[coin] || 0) < 60000) continue; 
 
         const candles = await getCandles(coin);
         if (candles.length < 30) continue;
@@ -153,41 +154,43 @@ const runScanner = async () => {
         const rsi = RSI.calculate({ values: closes, period: 14 }).pop();
         const atr = ATR.calculate({ high: candles.map(c => c.high), low: candles.map(c => c.low), close: closes, period: 14 }).pop();
 
+        const price = closes.at(-1);
+        const momentum = price > closes.at(-2);
         const isBull = ema9 > ema21;
-        const momentum = closes.at(-1) > closes.at(-2);
-        const volatility = (atr / closes[closes.length-1]) * 100;
-        let score = (rsi < 60 ? 1 : 0) + (isBull ? 1 : 0) + (momentum ? 1 : 0);
+        const volatility = (atr / price) * 100;
 
-        // --- ALWAYS LOG ANALYTICS ---
-        botLog(`📊 ${coin.padEnd(5)} | RSI: ${safe(rsi, 1)} | Trend: ${isBull ? "🟢" : "🔴"} | Score: ${score}/3 | Vol: ${volatility.toFixed(2)}%`);
+        // 4-CONDITION SCORE SYSTEM
+        let score = 0;
+        if (rsi < 60) score++;
+        if (isBull) score++;
+        if (momentum) score++;
+        if (volatility > 0.1) score++;
 
-        // 4. Relaxed Entry Logic (Micro-Balance Friendly)
-        if (score >= 2 && isBull && marketIsBullish && rsi < 65 && volatility > 0.08) {
-            if (lastKnownBal < 2) {
-                botLog(`⚠️ ${coin}: Signal valid, but balance < $2`);
-                continue;
-            }
+        botLog(`📊 ${coin.padEnd(5)} | Score: ${score}/4 | RSI: ${safe(rsi, 1)} | Vol: ${volatility.toFixed(2)}% | Trend: ${isBull ? "🟢" : "🔴"}`);
 
-            const tradeAmt = (lastKnownBal * 0.90).toFixed(2); // Use 90% of micro-balance
+        // ✅ BALANCED ENTRY (Micro-Balance Friendly)
+        if (score >= 3 && marketIsBullish && lastKnownBal > 2) {
+            const tradeAmt = (lastKnownBal * 0.25).toFixed(2);
             const bought = await executeOrder("buy", coin, tradeAmt);
             if (bought) {
                 activeTrades.push({ 
                     symbol: coin, entry: bought.price, qty: bought.qty, highest: bought.price, 
-                    stop: atr ? atr * 1.2 : bought.price * 0.012 
+                    stop: atr ? atr * 1.5 : bought.price * 0.015 
                 });
                 lastTradePerCoin[coin] = Date.now();
                 tradesThisHour++;
                 saveState();
-                botLog(`🚀 BUY SUCCESS: ${coin} @ ${bought.price} | Hour: ${tradesThisHour}`);
+                botLog(`🚀 BUY ${coin} @ ${bought.price} | Trades this hour: ${tradesThisHour}`);
                 fs.appendFileSync(LOG_FILE, `🚀 BUY: ${coin} @ ${bought.price}\n`);
             }
         }
     }
 
-    // 5. Check Exits
+    // 4. Check Exits
     for (let i = activeTrades.length - 1; i >= 0; i--) { await checkExits(activeTrades[i], i); }
 };
 
+// --- SMART EXIT LOGIC ---
 async function checkExits(t, idx) {
     try {
         const ticker = await axios.get(`https://api.coindcx.com/exchange/v1/markets/ticker?pair=${t.symbol}USDT`);
@@ -198,30 +201,30 @@ async function checkExits(t, idx) {
         const drop = ((t.highest - p) / t.highest) * 100;
         const stopPct = (t.stop / t.entry) * 100;
 
-        // FAST EXIT FOR HIGH TURNOVER
-        if ((gain > (0.5 + FEES) && drop > 0.2) || gain < -stopPct) {
+        // REAL PROFIT TARGET (1.2% + Fees)
+        if ((gain > (1.2 + FEES) && drop > 0.3) || gain < -stopPct) {
             const sold = await executeOrder("sell", t.symbol, 0, t.qty);
             if (sold) {
-                const pnlUSDT = (p - t.entry) * t.qty;
-                if (gain < 0) dailyLoss += Math.abs(pnlUSDT);
+                const pnl = (p - t.entry) * t.qty;
+                if (gain < 0) dailyLoss += Math.abs(pnl);
                 lossStreak = (gain <= 0) ? lossStreak + 1 : 0;
                 
                 tradeHistory.push({
                     symbol: t.symbol, entry: t.entry, exit: p,
-                    pnl: pnlUSDT.toFixed(2), percent: gain.toFixed(2), time: new Date().toLocaleTimeString()
+                    pnl: pnl.toFixed(2), percent: gain.toFixed(2), time: new Date().toLocaleTimeString()
                 });
 
                 activeTrades.splice(idx, 1);
                 saveState();
-                botLog(`💰 SOLD: ${t.symbol} | Gain: ${gain.toFixed(2)}% | PnL: $${pnlUSDT.toFixed(2)}`);
-                fs.appendFileSync(LOG_FILE, `🚪 SELL: ${t.symbol} | PnL: ${gain.toFixed(2)}% ($${pnlUSDT.toFixed(2)})\n`);
+                botLog(`💰 EXIT ${t.symbol} | ${gain.toFixed(2)}% | PnL: $${pnl.toFixed(2)}`);
+                fs.appendFileSync(LOG_FILE, `🚪 SELL: ${t.symbol} | PnL: ${gain.toFixed(2)}% ($${pnl.toFixed(2)})\n`);
             }
         }
     } catch (e) {}
 }
 
 app.listen(PORT, '0.0.0.0', () => {
-    botLog(`✅ APEX PRO v11.9.4 HYPER-AGGRESSIVE LIVE | PORT ${PORT}`);
+    botLog(`✅ APEX PRO v11.9.5 SMART-BALANCED LIVE | PORT ${PORT}`);
     runScanner();
     cron.schedule('*/30 * * * * *', runScanner);
 });
